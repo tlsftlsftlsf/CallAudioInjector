@@ -12,7 +12,7 @@ CallAudioInjector_FRAMEWORKS = AudioToolbox CoreAudio Foundation AVFoundation
 
 CallAudioInjectorUI_FILES = TweakUI.x
 CallAudioInjectorUI_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-deprecated-declarations
-CallAudioInjectorUI_FRAMEWORKS = UIKit Foundation AudioToolbox
+CallAudioInjectorUI_FRAMEWORKS = UIKit Foundation AudioToolbox AVFoundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
