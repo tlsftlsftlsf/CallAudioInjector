@@ -6,9 +6,11 @@
 #import <math.h>
 #import <sys/stat.h>
 #import <substrate.h>
+#import "EmbeddedAudio.h"
 
 #define PREF_PATH @"/var/mobile/Library/Preferences/com.tlsf.callaudioinjector.plist"
-#define DEFAULT_AUDIO_PATH @"/var/mobile/Media/inject_audio.wav"
+#define YUNFEI_PATH @"/var/mobile/Library/Application Support/AudioLoop/运费.mp3"
+#define TEMP_YUNFEI_PATH @"/tmp/运费.mp3"
 
 #define NOTIFY_PLAY   "com.tlsf.callaudioinjector.play"
 #define NOTIFY_STOP   "com.tlsf.callaudioinjector.stop"
@@ -19,7 +21,6 @@ static BOOL g_isInjecting = NO;
 static BOOL g_loopPlayback = YES;
 static BOOL g_muteMic = NO;
 static float g_gain = 1.0f;
-static NSString *g_audioFilePath = DEFAULT_AUDIO_PATH;
 
 // 双格式内存音频缓冲区（零文件依赖，零实时开销）
 static SInt16 *g_pcmBufferS16 = NULL;
@@ -47,8 +48,10 @@ static void BroadcastInjectionState(BOOL active) {
     notify_post(NOTIFY_STATE);
 }
 
-// 内存直接合成默认测试音频（48kHz，单声道，4秒悦耳和弦音，绝无沙盒或权限问题）
+// 内存直接合成备用音频
 static void SynthesizeDefaultMemoryAudio(void) {
+    if (g_pcmBufferS16 && g_pcmTotalFrames > 0) return;
+
     UInt32 sampleRate = 48000;
     UInt32 durationSec = 4;
     UInt32 totalFrames = sampleRate * durationSec;
@@ -66,13 +69,10 @@ static void SynthesizeDefaultMemoryAudio(void) {
         double t = (double)i / (double)sampleRate;
         double cycle = fmod(t, 1.0);
         double sampleVal = 0.0;
-
-        // 每秒节奏：0.75秒发声，0.25秒停顿
         if (cycle < 0.75) {
-            // 前两秒 587.33Hz (D5)，后两秒 880Hz (A5)
             double baseFreq = (t < 2.0) ? 587.33 : 880.0;
             double s1 = sin(2.0 * M_PI * baseFreq * t) * 0.55;
-            double s2 = sin(2.0 * M_PI * (baseFreq * 1.5) * t) * 0.25; // 五度泛音增添饱满度
+            double s2 = sin(2.0 * M_PI * (baseFreq * 1.5) * t) * 0.25;
             sampleVal = s1 + s2;
         }
 
@@ -90,38 +90,40 @@ static void SynthesizeDefaultMemoryAudio(void) {
     g_pcmBufferF32 = buf32;
     g_pcmTotalFrames = totalFrames;
     g_pcmFrameOffset = 0;
-
-    NSLog(@"[CallAudioInjector] [%s] 内存音频合成完毕: %u 帧 (48kHz)", getprogname(), (unsigned int)totalFrames);
 }
 
-// 尝试从文件解码用户自定义音频（支持 wav/mp3/m4a，失败时自动保持内存音频）
-static void TryLoadCustomAudioFile(void) {
-    NSArray *candidates = @[
-        g_audioFilePath ?: DEFAULT_AUDIO_PATH,
-        @"/var/mobile/Media/inject_audio.wav",
-        @"/var/mobile/Media/inject_audio.mp3",
-        @"/var/mobile/Media/inject_audio.m4a",
-        @"/tmp/inject_audio.wav",
-        @"/var/jb/var/mobile/Media/inject_audio.wav"
+// 加载并解码「运费.mp3」
+static void LoadYunfeiAudio(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *sourcePath = nil;
+
+    NSArray *paths = @[
+        YUNFEI_PATH,
+        @"/Library/Application Support/AudioLoop/运费.mp3",
+        @"/var/jb/Library/Application Support/AudioLoop/运费.mp3",
+        TEMP_YUNFEI_PATH
     ];
 
-    NSString *validPath = nil;
-    NSFileManager *fm = [NSFileManager defaultManager];
-    for (NSString *path in candidates) {
-        if ([fm fileExistsAtPath:path]) {
-            validPath = path;
+    for (NSString *p in paths) {
+        if ([fm fileExistsAtPath:p]) {
+            sourcePath = p;
             break;
         }
     }
 
-    if (!validPath) {
-        return; // 保留预先合成的内存音频
+    // 若均不存在，自动释放内置二进制到 /tmp
+    if (!sourcePath) {
+        NSData *embedData = [NSData dataWithBytes:g_yunfeiMp3Bytes length:g_yunfeiMp3Bytes_len];
+        [embedData writeToFile:TEMP_YUNFEI_PATH atomically:YES];
+        chmod([TEMP_YUNFEI_PATH UTF8String], 0666);
+        sourcePath = TEMP_YUNFEI_PATH;
     }
 
-    NSURL *fileURL = [NSURL fileURLWithPath:validPath];
+    NSURL *fileURL = [NSURL fileURLWithPath:sourcePath];
     ExtAudioFileRef audioFile = NULL;
     OSStatus status = ExtAudioFileOpenURL((__bridge CFURLRef)fileURL, &audioFile);
     if (status != noErr || !audioFile) {
+        SynthesizeDefaultMemoryAudio();
         return;
     }
 
@@ -142,6 +144,7 @@ static void TryLoadCustomAudioFile(void) {
                                      &clientASBD);
     if (status != noErr) {
         ExtAudioFileDispose(audioFile);
+        SynthesizeDefaultMemoryAudio();
         return;
     }
 
@@ -150,6 +153,7 @@ static void TryLoadCustomAudioFile(void) {
     status = ExtAudioFileGetProperty(audioFile, kExtAudioFileProperty_FileLengthFrames, &propSize, &totalFrames);
     if (status != noErr || totalFrames <= 0) {
         ExtAudioFileDispose(audioFile);
+        SynthesizeDefaultMemoryAudio();
         return;
     }
 
@@ -160,6 +164,7 @@ static void TryLoadCustomAudioFile(void) {
         if (buf32) free(buf32);
         if (buf16) free(buf16);
         ExtAudioFileDispose(audioFile);
+        SynthesizeDefaultMemoryAudio();
         return;
     }
 
@@ -176,10 +181,10 @@ static void TryLoadCustomAudioFile(void) {
     if (status != noErr || framesToRead == 0) {
         free(buf32);
         free(buf16);
+        SynthesizeDefaultMemoryAudio();
         return;
     }
 
-    // 同步生成 SInt16 缓冲区
     for (UInt32 i = 0; i < framesToRead; i++) {
         float f = buf32[i];
         int32_t s = (int32_t)(f * 32767.0f);
@@ -196,25 +201,19 @@ static void TryLoadCustomAudioFile(void) {
     g_pcmTotalFrames = framesToRead;
     g_pcmFrameOffset = 0;
 
-    NSLog(@"[CallAudioInjector] [%s] 成功载入外部音频文件: %@ (%u 帧)", getprogname(), validPath, (unsigned int)framesToRead);
+    NSLog(@"[CallAudioInjector] [%s] 成功载入解码「运费.mp3」: %u 帧 (48kHz)", getprogname(), (unsigned int)framesToRead);
 }
 
 static void ReloadPreferences(void) {
     NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:PREF_PATH];
     if (prefs) {
-        g_audioFilePath = prefs[@"audioPath"] ?: DEFAULT_AUDIO_PATH;
         g_loopPlayback = prefs[@"loopPlayback"] ? [prefs[@"loopPlayback"] boolValue] : YES;
         g_muteMic = prefs[@"muteMic"] ? [prefs[@"muteMic"] boolValue] : NO;
         g_gain = prefs[@"gain"] ? [prefs[@"gain"] floatValue] : 1.0f;
-    } else {
-        g_audioFilePath = DEFAULT_AUDIO_PATH;
-        g_loopPlayback = YES;
-        g_muteMic = NO;
-        g_gain = 1.0f;
     }
 }
 
-// 核心实时混音函数（零内存分配，零文件IO，耗时 < 2 微秒）
+// 核心实时混音函数
 static void MixAudioIntoBufferList(AudioBufferList *ioData, UInt32 inNumberFrames, float gain, BOOL muteMic) {
     if (!g_isInjecting || ioData == NULL || inNumberFrames == 0 || g_pcmTotalFrames == 0) {
         return;
@@ -245,7 +244,6 @@ static void MixAudioIntoBufferList(AudioBufferList *ioData, UInt32 inNumberFrame
         UInt32 bytesPerSample = bytesPerFrame / chCount;
 
         if (bytesPerSample == 4 && g_pcmBufferF32 != NULL) {
-            // Float32 混音
             Float32 *target = (Float32 *)buf->mData;
             Float32 *inj = g_pcmBufferF32 + g_pcmFrameOffset;
 
@@ -261,7 +259,6 @@ static void MixAudioIntoBufferList(AudioBufferList *ioData, UInt32 inNumberFrame
                 }
             }
         } else if (bytesPerSample == 2 && g_pcmBufferS16 != NULL) {
-            // SInt16 混音
             SInt16 *target = (SInt16 *)buf->mData;
             SInt16 *inj = g_pcmBufferS16 + g_pcmFrameOffset;
 
@@ -301,11 +298,8 @@ static OSStatus my_AudioUnitRender(AudioUnit inUnit,
 
     if (status == noErr && g_isInjecting && ioData != NULL && inNumberFrames > 0) {
         if (inOutputBusNumber == 1) {
-            // Bus 1 (麦克风上行链路): 注入指定音频，对方清晰听到
+            // Bus 1 (麦克风上行流): 注入「运费.mp3」给通话对方听
             MixAudioIntoBufferList(ioData, inNumberFrames, g_gain, g_muteMic);
-        } else if (inOutputBusNumber == 0) {
-            // Bus 0 (听筒/扬声器下行链路): 同步注入，让本机通话者也能实时听到声音确认注入中
-            MixAudioIntoBufferList(ioData, inNumberFrames, g_gain * 0.75f, NO);
         }
     }
 
@@ -334,21 +328,21 @@ static void HandleDarwinNotifications(CFNotificationCenterRef center,
     NSString *notifyName = (__bridge NSString *)name;
     if ([notifyName isEqualToString:@NOTIFY_PLAY]) {
         ReloadPreferences();
-        TryLoadCustomAudioFile();
+        LoadYunfeiAudio();
         g_isInjecting = YES;
         g_pcmFrameOffset = 0;
-        NSLog(@"[CallAudioInjector] [%s] 收到 PLAY -> 激活音频注入 (总帧数: %u)", getprogname(), g_pcmTotalFrames);
+        NSLog(@"[CallAudioInjector] [%s] 收到 PLAY -> 激活「运费.mp3」注入 (总帧数: %u)", getprogname(), g_pcmTotalFrames);
         BroadcastInjectionState(YES);
     } else if ([notifyName isEqualToString:@NOTIFY_STOP]) {
         g_isInjecting = NO;
         g_pcmFrameOffset = 0;
-        NSLog(@"[CallAudioInjector] [%s] 收到 STOP -> 停止音频注入", getprogname());
+        NSLog(@"[CallAudioInjector] [%s] 收到 STOP -> 停止注入", getprogname());
         BroadcastInjectionState(NO);
     } else if ([notifyName isEqualToString:@NOTIFY_TOGGLE]) {
         ReloadPreferences();
         g_isInjecting = !g_isInjecting;
         if (g_isInjecting) {
-            TryLoadCustomAudioFile();
+            LoadYunfeiAudio();
             g_pcmFrameOffset = 0;
         }
         NSLog(@"[CallAudioInjector] [%s] 收到 TOGGLE -> 状态: %d", getprogname(), g_isInjecting);
@@ -362,12 +356,8 @@ static void HandleDarwinNotifications(CFNotificationCenterRef center,
         NSLog(@"[CallAudioInjector] ★★★ 正在注入进程: %s (PID: %d) ★★★", prog, getpid());
 
         ReloadPreferences();
-        // 1. 立即初始化双格式内存音频缓冲区，确保无论磁盘/沙盒状态如何都有音频可播
-        SynthesizeDefaultMemoryAudio();
-        // 2. 尝试读取自定义音频
-        TryLoadCustomAudioFile();
+        LoadYunfeiAudio();
 
-        // 3. Hook AudioUnitRender
         void *renderSym = dlsym(RTLD_DEFAULT, "AudioUnitRender");
         if (!renderSym) {
             dlopen("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox", RTLD_NOW | RTLD_GLOBAL);
@@ -382,14 +372,12 @@ static void HandleDarwinNotifications(CFNotificationCenterRef center,
             NSLog(@"[CallAudioInjector] [%s] Hook AudioUnitRender 成功！", prog);
         }
 
-        // 4. Hook AudioUnitProcess
         void *processSym = dlsym(RTLD_DEFAULT, "AudioUnitProcess");
         if (processSym) {
             MSHookFunction(processSym, (void *)my_AudioUnitProcess, (void **)&orig_AudioUnitProcess);
             NSLog(@"[CallAudioInjector] [%s] Hook AudioUnitProcess 成功！", prog);
         }
 
-        // 5. 注册 Darwin 跨进程广播
         CFNotificationCenterRef darwin = CFNotificationCenterGetDarwinNotifyCenter();
         CFNotificationCenterAddObserver(darwin, NULL, HandleDarwinNotifications, CFSTR(NOTIFY_PLAY), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         CFNotificationCenterAddObserver(darwin, NULL, HandleDarwinNotifications, CFSTR(NOTIFY_STOP), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);

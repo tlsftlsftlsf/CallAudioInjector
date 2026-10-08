@@ -3,10 +3,13 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <AVFoundation/AVFoundation.h>
 #import <notify.h>
-#import <math.h>
+#import <sys/stat.h>
 #import <substrate.h>
+#import "EmbeddedAudio.h"
 
 #define PREF_PATH @"/var/mobile/Library/Preferences/com.tlsf.callaudioinjector.plist"
+#define YUNFEI_PATH @"/var/mobile/Library/Application Support/AudioLoop/运费.mp3"
+
 #define NOTIFY_PLAY       "com.tlsf.callaudioinjector.play"
 #define NOTIFY_STOP       "com.tlsf.callaudioinjector.stop"
 #define NOTIFY_TOGGLE     "com.tlsf.callaudioinjector.toggle"
@@ -14,7 +17,7 @@
 #define NOTIFY_TOGGLE_UI  "com.tlsf.callaudioinjector.toggle_ui"
 
 // ============================================================================
-// 本机同步音频播放器（保证通话/非通话状态下本机均能清晰听到播放的音频）
+// 本机同步音频播放器（基于内置「运费.mp3」直接发声）
 // ============================================================================
 
 @interface CAILocalAudioPlayer : NSObject <AVAudioPlayerDelegate>
@@ -36,101 +39,46 @@
     return instance;
 }
 
-- (NSData *)generateDefaultWavData {
-    UInt32 sampleRate = 48000;
-    UInt16 channels = 1;
-    UInt16 bitsPerSample = 16;
-    UInt32 durationSec = 4;
-    UInt32 totalSamples = sampleRate * durationSec;
-    UInt32 dataBytes = totalSamples * (bitsPerSample / 8);
-
-    NSMutableData *wav = [NSMutableData dataWithCapacity:44 + dataBytes];
-    [wav appendBytes:"RIFF" length:4];
-    UInt32 chunkSize = 36 + dataBytes;
-    [wav appendBytes:&chunkSize length:4];
-    [wav appendBytes:"WAVE" length:4];
-    [wav appendBytes:"fmt " length:4];
-    UInt32 sub1 = 16;
-    [wav appendBytes:&sub1 length:4];
-    UInt16 fmt = 1;
-    [wav appendBytes:&fmt length:2];
-    [wav appendBytes:&channels length:2];
-    [wav appendBytes:&sampleRate length:4];
-    UInt32 byteRate = sampleRate * channels * (bitsPerSample / 8);
-    [wav appendBytes:&byteRate length:4];
-    UInt16 align = channels * (bitsPerSample / 8);
-    [wav appendBytes:&align length:2];
-    [wav appendBytes:&bitsPerSample length:2];
-    [wav appendBytes:"data" length:4];
-    [wav appendBytes:&dataBytes length:4];
-
-    for (UInt32 i = 0; i < totalSamples; i++) {
-        double t = (double)i / (double)sampleRate;
-        double cycle = fmod(t, 1.0);
-        double sampleVal = 0.0;
-        if (cycle < 0.75) {
-            double freq = (t < 2.0) ? 587.33 : 880.0;
-            double s1 = sin(2.0 * M_PI * freq * t) * 0.55;
-            double s2 = sin(2.0 * M_PI * (freq * 1.5) * t) * 0.25;
-            sampleVal = s1 + s2;
-        }
-        int16_t s16 = (int16_t)(sampleVal * 32767.0);
-        [wav appendBytes:&s16 length:2];
-    }
-    return wav;
-}
-
 - (void)startPlaying {
     dispatch_async(dispatch_get_main_queue(), ^{
         [self stopPlaying];
 
-        // 1. 设置系统 AudioSession 支持混音、蓝牙、听筒与扬声器
-        AVAudioSession *session = [AVAudioSession sharedInstance];
-        NSError *error = nil;
-        [session setCategory:AVAudioSessionCategoryPlayback
-                 withOptions:AVAudioSessionCategoryOptionMixWithOthers |
-                             AVAudioSessionCategoryOptionAllowBluetooth |
-                             AVAudioSessionCategoryOptionDefaultToSpeaker
-                       error:&error];
-        [session setActive:YES error:&error];
-
-        // 2. 查找用户自定义音频文件
-        NSArray *candidates = @[
-            @"/var/mobile/Media/inject_audio.wav",
-            @"/var/mobile/Media/inject_audio.mp3",
-            @"/var/mobile/Media/inject_audio.m4a",
-            @"/tmp/inject_audio.wav",
-            @"/var/jb/var/mobile/Media/inject_audio.wav"
-        ];
-
-        NSString *foundPath = nil;
         NSFileManager *fm = [NSFileManager defaultManager];
-        for (NSString *p in candidates) {
-            if ([fm fileExistsAtPath:p]) {
-                foundPath = p;
-                break;
-            }
+        NSString *dir = [YUNFEI_PATH stringByDeletingLastPathComponent];
+        if (![fm fileExistsAtPath:dir]) {
+            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
         }
 
-        if (foundPath) {
-            NSURL *url = [NSURL fileURLWithPath:foundPath];
+        // 如果目标文件不存在，使用内置二进制数据直接释放生成该文件
+        if (![fm fileExistsAtPath:YUNFEI_PATH]) {
+            NSData *embedData = [NSData dataWithBytes:g_yunfeiMp3Bytes length:g_yunfeiMp3Bytes_len];
+            [embedData writeToFile:YUNFEI_PATH atomically:YES];
+            chmod([YUNFEI_PATH UTF8String], 0666);
+            NSLog(@"[CallAudioInjectorUI] 成功释放内置 运费.mp3 到: %@", YUNFEI_PATH);
+        }
+
+        NSError *error = nil;
+        // 1. 优先从文件路径加载
+        if ([fm fileExistsAtPath:YUNFEI_PATH]) {
+            NSURL *url = [NSURL fileURLWithPath:YUNFEI_PATH];
             self.player = [[AVAudioPlayer alloc] initWithContentsOfURL:url error:&error];
         }
 
+        // 2. 备用：直接从嵌入的二进制内存加载
         if (!self.player) {
-            NSData *wavData = [self generateDefaultWavData];
-            self.player = [[AVAudioPlayer alloc] initWithData:wavData error:&error];
+            NSData *embedData = [NSData dataWithBytes:g_yunfeiMp3Bytes length:g_yunfeiMp3Bytes_len];
+            self.player = [[AVAudioPlayer alloc] initWithData:embedData fileTypeHint:AVFileTypeMPEGLayer3 error:&error];
         }
 
         if (self.player) {
             self.player.delegate = self;
-            self.player.numberOfLoops = -1; // 循环播放
-            self.player.volume = 0.85f;      // 适中舒适音量
+            self.player.numberOfLoops = -1; // 无限循环
+            self.player.volume = 1.0f;      // 保持全音量
             [self.player prepareToPlay];
             BOOL ok = [self.player play];
-            NSLog(@"[CallAudioInjectorUI] ★★★ 本机听筒/扬声器音频同步播放已启动: %d (源: %@) ★★★", ok, foundPath ?: @"内置高清和弦");
+            NSLog(@"[CallAudioInjectorUI] ★★★ 本机播放「运费.mp3」成功: %d ★★★", ok);
         } else {
-            NSLog(@"[CallAudioInjectorUI] 初始化本地播放器失败: %@", error);
+            NSLog(@"[CallAudioInjectorUI] 创建播放器失败: %@", error);
         }
     });
 }
@@ -140,7 +88,7 @@
         if (self.player) {
             [self.player stop];
             self.player = nil;
-            NSLog(@"[CallAudioInjectorUI] 本机音频同步播放已停止");
+            NSLog(@"[CallAudioInjectorUI] 本机播放「运费.mp3」已停止");
         }
     });
 }
@@ -195,7 +143,7 @@ static void UpdateFloatingButtonUI(BOOL active) {
 // 点击按钮响应动作（即时触觉 + 即时视觉 + 本机发声 + 跨进程通知）
 static void OnFloatingButtonClicked(void) {
     g_isInjecting = !g_isInjecting;
-    NSLog(@"[CallAudioInjectorUI] ★★★ 悬浮按钮切换！当前注入状态: %d ★★★", g_isInjecting);
+    NSLog(@"[CallAudioInjectorUI] ★★★ 悬浮按钮点击！当前注入状态: %d ★★★", g_isInjecting);
 
     // 1. 强力震动反馈
     UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
@@ -211,7 +159,7 @@ static void OnFloatingButtonClicked(void) {
         g_floatingButton.transform = CGAffineTransformIdentity;
     } completion:nil];
 
-    // 4. 控制本机听筒/扬声器同步发声
+    // 4. 控制本机播放「运费.mp3」并广播指令给 audiomxd / mediaserverd
     if (g_isInjecting) {
         [[CAILocalAudioPlayer sharedInstance] startPlaying];
         notify_post(NOTIFY_PLAY);
