@@ -16,4 +16,4 @@ CallAudioInjectorUI_FRAMEWORKS = UIKit Foundation AudioToolbox
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
-INSTALL_TARGET_PROCESSES = mediaserverd SpringBoard
+INSTALL_TARGET_PROCESSES = audiomxd mediaserverd callservicesd InCallService SpringBoard

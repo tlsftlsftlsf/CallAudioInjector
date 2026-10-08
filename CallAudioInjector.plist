@@ -2,12 +2,17 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Filter</key>
-    <dict>
-        <key>Executables</key>
-        <array>
-            <string>mediaserverd</string>
-        </array>
-    </dict>
+	<key>Filter</key>
+	<dict>
+		<key>Executables</key>
+		<array>
+			<string>audiomxd</string>
+			<string>mediaserverd</string>
+			<string>callservicesd</string>
+			<string>InCallService</string>
+			<string>coreaudiod</string>
+			<string>MobilePhone</string>
+		</array>
+	</dict>
 </dict>
 </plist>
