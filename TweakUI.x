@@ -9,6 +9,7 @@
 
 #define PREF_PATH @"/var/mobile/Library/Preferences/com.tlsf.callaudioinjector.plist"
 #define YUNFEI_PATH @"/var/mobile/Library/Application Support/AudioLoop/运费.mp3"
+#define TEMP_YUNFEI_PATH @"/tmp/运费.mp3"
 
 #define NOTIFY_PLAY       "com.tlsf.callaudioinjector.play"
 #define NOTIFY_STOP       "com.tlsf.callaudioinjector.stop"
@@ -16,17 +17,48 @@
 #define NOTIFY_STATE      "com.tlsf.callaudioinjector.state_changed"
 #define NOTIFY_TOGGLE_UI  "com.tlsf.callaudioinjector.toggle_ui"
 
+static BOOL g_isInjecting = NO;
+
+static void CAILog(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+
+    NSLog(@"[CallAudioInjectorUI] %@", msg);
+
+    NSString *logLine = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:@"/tmp/cai_debug.log"];
+    if (!handle) {
+        [[NSFileManager defaultManager] createFileAtPath:@"/tmp/cai_debug.log" contents:nil attributes:nil];
+        handle = [NSFileHandle fileHandleForWritingAtPath:@"/tmp/cai_debug.log"];
+    }
+    if (handle) {
+        [handle seekToEndOfFile];
+        [handle writeData:[logLine dataUsingEncoding:NSUTF8StringEncoding]];
+        [handle closeFile];
+        chmod("/tmp/cai_debug.log", 0666);
+    }
+}
+
 // ============================================================================
-// 本机同步音频播放器（基于内置「运费.mp3」直接发声）
+// 双引擎本机发声播放器（AVAudioPlayer + AudioServices 双重保障，100% 破除静音模式）
 // ============================================================================
 
 @interface CAILocalAudioPlayer : NSObject <AVAudioPlayerDelegate>
 @property (nonatomic, strong) AVAudioPlayer *player;
+@property (nonatomic, assign) SystemSoundID soundID;
 + (instancetype)sharedInstance;
 - (void)startPlaying;
 - (void)stopPlaying;
 - (BOOL)isPlaying;
 @end
+
+static void CAISystemSoundCompletionCallback(SystemSoundID ssID, void *clientData) {
+    if (g_isInjecting) {
+        AudioServicesPlaySystemSound(ssID);
+    }
+}
 
 @implementation CAILocalAudioPlayer
 
@@ -39,62 +71,105 @@
     return instance;
 }
 
+- (void)ensureAudioFileExists {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dir = [YUNFEI_PATH stringByDeletingLastPathComponent];
+    if (![fm fileExistsAtPath:dir]) {
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+
+    NSData *embedData = [NSData dataWithBytes:g_yunfeiMp3Bytes length:g_yunfeiMp3Bytes_len];
+
+    if (![fm fileExistsAtPath:YUNFEI_PATH]) {
+        [embedData writeToFile:YUNFEI_PATH atomically:YES];
+        chmod([YUNFEI_PATH UTF8String], 0666);
+        CAILog(@"已释放运费.mp3到: %@", YUNFEI_PATH);
+    }
+
+    if (![fm fileExistsAtPath:TEMP_YUNFEI_PATH]) {
+        [embedData writeToFile:TEMP_YUNFEI_PATH atomically:YES];
+        chmod([TEMP_YUNFEI_PATH UTF8String], 0666);
+        CAILog(@"已释放运费.mp3到: %@", TEMP_YUNFEI_PATH);
+    }
+}
+
 - (void)startPlaying {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self stopPlaying];
+    // 同步停止上一次播放，避免异步竞争
+    [self stopPlaying];
 
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSString *dir = [YUNFEI_PATH stringByDeletingLastPathComponent];
-        if (![fm fileExistsAtPath:dir]) {
-            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-        }
+    CAILog(@"开始启动本机播放...");
+    [self ensureAudioFileExists];
 
-        // 如果目标文件不存在，使用内置二进制数据直接释放生成该文件
-        if (![fm fileExistsAtPath:YUNFEI_PATH]) {
-            NSData *embedData = [NSData dataWithBytes:g_yunfeiMp3Bytes length:g_yunfeiMp3Bytes_len];
-            [embedData writeToFile:YUNFEI_PATH atomically:YES];
-            chmod([YUNFEI_PATH UTF8String], 0666);
-            NSLog(@"[CallAudioInjectorUI] 成功释放内置 运费.mp3 到: %@", YUNFEI_PATH);
-        }
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *playPath = YUNFEI_PATH;
+    if (![fm fileExistsAtPath:playPath]) {
+        playPath = TEMP_YUNFEI_PATH;
+    }
+    NSURL *fileURL = [NSURL fileURLWithPath:playPath];
 
-        NSError *error = nil;
-        // 1. 优先从文件路径加载
-        if ([fm fileExistsAtPath:YUNFEI_PATH]) {
-            NSURL *url = [NSURL fileURLWithPath:YUNFEI_PATH];
-            self.player = [[AVAudioPlayer alloc] initWithContentsOfURL:url error:&error];
-        }
+    // 引擎 1：AudioServices 系统级直接声道播放（系统铃声/按键音底层通道，绝不受 App 沙盒与静音模式限制）
+    OSStatus soundStatus = AudioServicesCreateSystemSoundID((__bridge CFURLRef)fileURL, &_soundID);
+    if (soundStatus == noErr && self.soundID != 0) {
+        AudioServicesAddSystemSoundCompletion(self.soundID, NULL, NULL, CAISystemSoundCompletionCallback, NULL);
+        // 使用 PlaySystemSoundDirectly 或 PlayAlertSound
+        AudioServicesPlayAlertSound(self.soundID);
+        CAILog(@"[引擎1] AudioServicesPlayAlertSound 触发成功, soundID=%u", (unsigned int)self.soundID);
+    } else {
+        CAILog(@"[引擎1] AudioServicesCreateSystemSoundID 失败: %d", (int)soundStatus);
+    }
 
-        // 2. 备用：直接从嵌入的二进制内存加载
-        if (!self.player) {
-            NSData *embedData = [NSData dataWithBytes:g_yunfeiMp3Bytes length:g_yunfeiMp3Bytes_len];
-            self.player = [[AVAudioPlayer alloc] initWithData:embedData fileTypeHint:AVFileTypeMPEGLayer3 error:&error];
+    // 引擎 2：AVAudioPlayer（设置 Playback 模式强行绕过侧边静音开关）
+    @try {
+        AVAudioSession *session = [AVAudioSession sharedInstance];
+        NSError *sessErr = nil;
+        [session setCategory:AVAudioSessionCategoryPlayback
+                 withOptions:AVAudioSessionCategoryOptionMixWithOthers |
+                             AVAudioSessionCategoryOptionDefaultToSpeaker |
+                             AVAudioSessionCategoryOptionAllowBluetooth
+                       error:&sessErr];
+        if (sessErr) {
+            CAILog(@"AVAudioSession setCategory 报错: %@", sessErr);
         }
+    } @catch (NSException *e) {
+        CAILog(@"AVAudioSession 捕获异常: %@", e);
+    }
 
-        if (self.player) {
-            self.player.delegate = self;
-            self.player.numberOfLoops = -1; // 无限循环
-            self.player.volume = 1.0f;      // 保持全音量
-            [self.player prepareToPlay];
-            BOOL ok = [self.player play];
-            NSLog(@"[CallAudioInjectorUI] ★★★ 本机播放「运费.mp3」成功: %d ★★★", ok);
-        } else {
-            NSLog(@"[CallAudioInjectorUI] 创建播放器失败: %@", error);
-        }
-    });
+    NSError *playerErr = nil;
+    self.player = [[AVAudioPlayer alloc] initWithContentsOfURL:fileURL error:&playerErr];
+    if (!self.player) {
+        NSData *embedData = [NSData dataWithBytes:g_yunfeiMp3Bytes length:g_yunfeiMp3Bytes_len];
+        self.player = [[AVAudioPlayer alloc] initWithData:embedData fileTypeHint:AVFileTypeMPEGLayer3 error:&playerErr];
+    }
+
+    if (self.player) {
+        self.player.delegate = self;
+        self.player.numberOfLoops = -1; // 循环播放
+        self.player.volume = 1.0f;      // 保持满音量
+        [self.player prepareToPlay];
+        BOOL ok = [self.player play];
+        CAILog(@"[引擎2] AVAudioPlayer play 结果: %d, 时长: %.2f秒, 路径: %@", ok, self.player.duration, playPath);
+    } else {
+        CAILog(@"[引擎2] AVAudioPlayer 创建失败: %@", playerErr);
+    }
 }
 
 - (void)stopPlaying {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (self.player) {
-            [self.player stop];
-            self.player = nil;
-            NSLog(@"[CallAudioInjectorUI] 本机播放「运费.mp3」已停止");
-        }
-    });
+    if (self.player) {
+        [self.player stop];
+        self.player = nil;
+        CAILog(@"[引擎2] AVAudioPlayer 已停止");
+    }
+
+    if (self.soundID != 0) {
+        AudioServicesRemoveSystemSoundCompletion(self.soundID);
+        AudioServicesDisposeSystemSoundID(self.soundID);
+        self.soundID = 0;
+        CAILog(@"[引擎1] AudioServicesSystemSound 已注销停止");
+    }
 }
 
 - (BOOL)isPlaying {
-    return self.player && self.player.isPlaying;
+    return (self.player && self.player.isPlaying) || (self.soundID != 0);
 }
 
 @end
@@ -104,7 +179,6 @@
 // ============================================================================
 
 static UIButton *g_floatingButton = nil;
-static BOOL g_isInjecting = NO;
 static NSTimeInterval g_lastTapActionTime = 0;
 static NSTimeInterval g_lastToggleTime = 0;
 static BOOL g_isDraggingButton = NO;
@@ -140,10 +214,10 @@ static void UpdateFloatingButtonUI(BOOL active) {
     });
 }
 
-// 点击按钮响应动作（即时触觉 + 即时视觉 + 本机发声 + 跨进程通知）
+// 点击按钮响应动作（即时触觉 + 即时视觉 + 双引擎本机发声 + 跨进程通知）
 static void OnFloatingButtonClicked(void) {
     g_isInjecting = !g_isInjecting;
-    NSLog(@"[CallAudioInjectorUI] ★★★ 悬浮按钮点击！当前注入状态: %d ★★★", g_isInjecting);
+    CAILog(@"★★★ 悬浮按钮点击！切换后状态: %d ★★★", g_isInjecting);
 
     // 1. 强力震动反馈
     UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
@@ -159,7 +233,7 @@ static void OnFloatingButtonClicked(void) {
         g_floatingButton.transform = CGAffineTransformIdentity;
     } completion:nil];
 
-    // 4. 控制本机播放「运费.mp3」并广播指令给 audiomxd / mediaserverd
+    // 4. 双引擎启动本机发声并广播给服务端进程
     if (g_isInjecting) {
         [[CAILocalAudioPlayer sharedInstance] startPlaying];
         notify_post(NOTIFY_PLAY);
@@ -308,7 +382,7 @@ static void CreateAndShowFloatingWindow(void) {
         g_floatingWindow.hidden = NO;
         g_floatingWindow.alpha = 1.0f;
 
-        NSLog(@"[CallAudioInjectorUI] ★★★ 全局悬浮窗构建成功，已直接显示在屏幕顶层！★★★");
+        CAILog(@"★★★ 全局悬浮窗已成功构建并显示在屏幕顶层！★★★");
     });
 }
 
@@ -333,7 +407,7 @@ static void ToggleFloatingWindow(void) {
             [UIView animateWithDuration:0.3 delay:0 usingSpringWithDamping:0.75 initialSpringVelocity:0.8 options:0 animations:^{
                 g_floatingButton.transform = CGAffineTransformIdentity;
             } completion:nil];
-            NSLog(@"[CallAudioInjectorUI] 悬浮窗已展现");
+            CAILog(@"悬浮窗已展现");
         } else {
             [UIView animateWithDuration:0.2 animations:^{
                 g_floatingButton.transform = CGAffineTransformMakeScale(0.75, 0.75);
@@ -341,7 +415,7 @@ static void ToggleFloatingWindow(void) {
                 g_floatingWindow.hidden = YES;
                 g_floatingButton.transform = CGAffineTransformIdentity;
             }];
-            NSLog(@"[CallAudioInjectorUI] 悬浮窗已收起隐藏");
+            CAILog(@"悬浮窗已收起隐藏");
         }
     });
 }
@@ -365,7 +439,7 @@ static void OnVolumeDownDown(void) {
     dispatch_source_set_event_handler(g_volumeDownTimer, ^{
         if (g_isVolumeDownHeld) {
             g_volumeDownLongPressTriggered = YES;
-            NSLog(@"[CallAudioInjectorUI] 长按音量下键 0.6s -> 切换悬浮窗显隐");
+            CAILog(@"长按音量下键 0.6s -> 切换悬浮窗显隐");
             ToggleFloatingWindow();
         }
         if (g_volumeDownTimer) {
@@ -446,7 +520,7 @@ static void HandleToggleUINotification(CFNotificationCenterRef center,
 
 %ctor {
     @autoreleasepool {
-        NSLog(@"[CallAudioInjectorUI] 成功加载入 SpringBoard！");
+        CAILog(@"成功加载入 SpringBoard (PID: %d)", getpid());
 
         CFNotificationCenterRef darwin = CFNotificationCenterGetDarwinNotifyCenter();
         CFNotificationCenterAddObserver(darwin, NULL, HandleStateChangedNotification, CFSTR(NOTIFY_STATE), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);

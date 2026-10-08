@@ -41,6 +41,28 @@ static OSStatus (*orig_AudioUnitProcess)(AudioUnit inUnit,
                                          UInt32 inNumberFrames,
                                          AudioBufferList *ioData);
 
+static void CAIServerLog(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+
+    NSLog(@"[CallAudioInjectorServer] %@", msg);
+
+    NSString *logLine = [NSString stringWithFormat:@"[%@] [%s:%d] %@\n", [NSDate date], getprogname(), getpid(), msg];
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:@"/tmp/cai_debug.log"];
+    if (!handle) {
+        [[NSFileManager defaultManager] createFileAtPath:@"/tmp/cai_debug.log" contents:nil attributes:nil];
+        handle = [NSFileHandle fileHandleForWritingAtPath:@"/tmp/cai_debug.log"];
+    }
+    if (handle) {
+        [handle seekToEndOfFile];
+        [handle writeData:[logLine dataUsingEncoding:NSUTF8StringEncoding]];
+        [handle closeFile];
+        chmod("/tmp/cai_debug.log", 0666);
+    }
+}
+
 static void BroadcastInjectionState(BOOL active) {
     int token = 0;
     notify_register_check(NOTIFY_STATE, &token);
@@ -201,7 +223,7 @@ static void LoadYunfeiAudio(void) {
     g_pcmTotalFrames = framesToRead;
     g_pcmFrameOffset = 0;
 
-    NSLog(@"[CallAudioInjector] [%s] 成功载入解码「运费.mp3」: %u 帧 (48kHz)", getprogname(), (unsigned int)framesToRead);
+    CAIServerLog(@"成功载入解码「运费.mp3」: %u 帧 (48kHz)", (unsigned int)framesToRead);
 }
 
 static void ReloadPreferences(void) {
@@ -331,12 +353,12 @@ static void HandleDarwinNotifications(CFNotificationCenterRef center,
         LoadYunfeiAudio();
         g_isInjecting = YES;
         g_pcmFrameOffset = 0;
-        NSLog(@"[CallAudioInjector] [%s] 收到 PLAY -> 激活「运费.mp3」注入 (总帧数: %u)", getprogname(), g_pcmTotalFrames);
+        CAIServerLog(@"收到 PLAY -> 激活「运费.mp3」注入 (总帧数: %u)", g_pcmTotalFrames);
         BroadcastInjectionState(YES);
     } else if ([notifyName isEqualToString:@NOTIFY_STOP]) {
         g_isInjecting = NO;
         g_pcmFrameOffset = 0;
-        NSLog(@"[CallAudioInjector] [%s] 收到 STOP -> 停止注入", getprogname());
+        CAIServerLog(@"收到 STOP -> 停止注入");
         BroadcastInjectionState(NO);
     } else if ([notifyName isEqualToString:@NOTIFY_TOGGLE]) {
         ReloadPreferences();
@@ -345,15 +367,14 @@ static void HandleDarwinNotifications(CFNotificationCenterRef center,
             LoadYunfeiAudio();
             g_pcmFrameOffset = 0;
         }
-        NSLog(@"[CallAudioInjector] [%s] 收到 TOGGLE -> 状态: %d", getprogname(), g_isInjecting);
+        CAIServerLog(@"收到 TOGGLE -> 状态: %d", g_isInjecting);
         BroadcastInjectionState(g_isInjecting);
     }
 }
 
 %ctor {
     @autoreleasepool {
-        const char *prog = getprogname();
-        NSLog(@"[CallAudioInjector] ★★★ 正在注入进程: %s (PID: %d) ★★★", prog, getpid());
+        CAIServerLog(@"成功加载注入守护进程 (PID: %d)", getpid());
 
         ReloadPreferences();
         LoadYunfeiAudio();
@@ -369,13 +390,13 @@ static void HandleDarwinNotifications(CFNotificationCenterRef center,
 
         if (renderSym) {
             MSHookFunction(renderSym, (void *)my_AudioUnitRender, (void **)&orig_AudioUnitRender);
-            NSLog(@"[CallAudioInjector] [%s] Hook AudioUnitRender 成功！", prog);
+            CAIServerLog(@"Hook AudioUnitRender 成功！");
         }
 
         void *processSym = dlsym(RTLD_DEFAULT, "AudioUnitProcess");
         if (processSym) {
             MSHookFunction(processSym, (void *)my_AudioUnitProcess, (void **)&orig_AudioUnitProcess);
-            NSLog(@"[CallAudioInjector] [%s] Hook AudioUnitProcess 成功！", prog);
+            CAIServerLog(@"Hook AudioUnitProcess 成功！");
         }
 
         CFNotificationCenterRef darwin = CFNotificationCenterGetDarwinNotifyCenter();
