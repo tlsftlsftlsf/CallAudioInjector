@@ -1,8 +1,8 @@
 Package: com.tlsf.callaudioinjector
 Name: CallAudioInjector
-Version: 1.0.0
+Version: 1.1.0
 Architecture: iphoneos-arm64
-Description: 通话时播放指定音频文件至麦克风输入流（对方听到），支持 iOS 15-17 无根越狱。
+Description: 通话时播放指定音频文件至麦克风输入流（对方听到），支持长按电源键显隐悬浮窗。适配 iOS 15-17 无根越狱。
 Maintainer: tlsf
 Author: tlsf
 Section: Tweaks

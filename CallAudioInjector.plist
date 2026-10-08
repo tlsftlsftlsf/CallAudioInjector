@@ -7,10 +7,12 @@
         <key>Executables</key>
         <array>
             <string>mediaserverd</string>
+            <string>SpringBoard</string>
         </array>
         <key>Bundles</key>
         <array>
             <string>com.apple.InCallService</string>
+            <string>com.apple.springboard</string>
         </array>
     </dict>
 </dict>

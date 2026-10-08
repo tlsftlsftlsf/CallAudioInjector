@@ -2,29 +2,28 @@
 
 CallAudioInjector 是一款专为 iOS 15 - 17（Rootless 无根越狱架构，如 Dopamine、palera1n）设计的系统级通话音频注入插件。
 
-本插件能够在通话过程中，将本地指定的音频文件解码并实时混入（或替换）麦克风采集音频流（Uplink / Bus 1），**实现通话对端（对方）清晰听到指定音频**。
+本插件能够在通话过程中，将本地指定的音频文件实时混入麦克风采集音频流（Uplink / Bus 1），**让通话另一方（对方）清晰听到指定音频**。支持**长按电源键（侧边键）随时唤出/隐藏悬浮控制按钮**。
 
 ---
 
-## 🌟 特性功能
+## 🌟 核心特性
 
-1. **对方听到（Uplink 麦克风注入）**：
-   - 拦截系统底层 `mediaserverd` 的 `AudioUnitRender` 函数。
-   - 截获麦克风采集数据，实现与原声混音（Mix）或麦克风静音独占播放（Replace）。
-2. **多格式自动重采样（无杂音/无变调）**：
-   - 基于 Apple CoreAudio `ExtAudioFile`，无论源音频是 WAV、MP3 还是 M4A，均会自动根据当前通话硬件采样率（如 16kHz/24kHz/48kHz）进行实时重采样与声道对齐。
-   - 支持 16-bit 线性 PCM 与 32-bit Float PCM 混音，内置饱和度截断算法防止爆音。
-3. **通话悬浮控制按钮**：
-   - 接通电话时自动在 `InCallService`（通话界面）上提供可自由拖拽的半透明悬浮胶囊按钮：`[🎙️ 注入音频]` / `[⏹ 停止注入]`。
-   - 点击即可瞬间开启或停止注入，状态实时切换。
-4. **灵活触发与自动化**：
-   - 支持全局 Darwin 通知触发（可在快捷指令/终端调用 `notify_post`）。
-   - 支持设置“接通电话自动开始播放”。
-   - 支持单曲循环播放与音量增益调节。
-5. **现代架构兼容**：
-   - 兼容 iOS 15.0 ~ 17.x。
-   - 适配 Rootless 方案（ElleKit / MobileSubstrate，支持 arm64 与 arm64e / PAC）。
-   - 配备 GitHub Actions 持续集成与自动化 Release 打包。
+1. **对方听到（底层麦克风流注入）**：
+   - 注入系统底层 `mediaserverd`，Hook `AudioUnitRender`。
+   - 截获麦克风采集端音频，实现混音（Mix）或麦克风静音独占播放（Replace）。
+2. **长按电源键 / 侧边键唤出（交互优化）**：
+   - Hook `SpringBoard` 的 `SBSiriHardwareButtonInteraction` 与 `SBHBLongPressGestureRecognizer`。
+   - 通话中**长按电源键/侧边键**即可唤出或隐藏半透明悬浮控制胶囊，带有轻触触觉震动反馈。
+   - 通话中拦截长按操作，防止意外唤起 Siri 打扰通话。
+3. **音频自动重采样（彻底解决杂音/变调）**：
+   - 基于 Apple CoreAudio `ExtAudioFile`，自动匹配当前通话硬件采样率（如 16kHz/24kHz/48kHz）与声道数。
+   - 支持 16-bit 线性 PCM 与 32-bit Float PCM 混音，内置溢出保护防爆音。
+4. **通话悬浮控制胶囊**：
+   - 半透明磨砂质感按钮：`[🎙️ 注入音频]`（绿色） / `[⏹ 停止注入]`（红色）。
+   - 支持全屏幕任意拖动，通话结束后自动隐藏并停止注入。
+5. **现代架构兼容与持续集成**：
+   - 兼容 iOS 15.0 ~ 17.x（支持 arm64 与 arm64e PAC 指针验证）。
+   - 配备 GitHub Actions 持续集成工作流，打 Tag 自动打包 Release `.deb`。
 
 ---
 
@@ -36,9 +35,9 @@ CallAudioInjector/
 │   └── workflows/
 │       └── build.yml             # GitHub Actions 自动化构建 & Release 工作流
 ├── Makefile                      # Theos 编译配置 (Rootless, arm64 + arm64e)
-├── control                       # Debian 软件包元数据
-├── CallAudioInjector.plist       # 进程过滤 (mediaserverd & InCallService)
-├── Tweak.x                       # 插件核心源码 (CoreAudio Hook & 悬浮窗)
+├── control                       # Debian 软件包元数据 (v1.1.0)
+├── CallAudioInjector.plist       # 进程过滤 (mediaserverd, SpringBoard, InCallService)
+├── Tweak.x                       # 插件核心源码 (AudioUnit Hook, 硬件按键拦截, 悬浮窗)
 ├── .gitignore                    # Git 忽略配置
 └── README.md                     # 说明文档
 ```
@@ -54,29 +53,24 @@ CallAudioInjector/
 cd /Users/tlsf/.gemini/antigravity/scratch/CallAudioInjector
 
 # 2. 编译并打包 release deb
-make package FINALPACKAGE=1
+make clean && make package FINALPACKAGE=1
 
 # 3. 生成的 deb 文件位于 packages/ 目录下
 ls -lh packages/
 ```
 
-> **提示**：若要在手机上快速安装并测试，可设置手机 IP 运行：
-> ```bash
-> make do THEOS_DEVICE_IP=192.168.1.xxx
-> ```
-
 ---
 
 ## 📲 安装与部署
 
-1. 将生成的 `.deb` 文件（如 `com.tlsf.callaudioinjector_1.0.0_iphoneos-arm64.deb`）传输到手机。
-2. 使用 **Sileo**、**Zebra**、**Filza** 或终端安装：
-   ```bash
-   dpkg -i com.tlsf.callaudioinjector_1.0.0_iphoneos-arm64.deb
+1. 将生成的 `.deb` 文件传输到手机：
+   ```text
+   packages/com.tlsf.callaudioinjector_1.1.0_iphoneos-arm64.deb
    ```
-3. 重启音频服务以确保插件载入：
+2. 在手机上使用 **Sileo**、**Zebra**、**Filza** 安装，或在终端执行：
    ```bash
-   killall -9 mediaserverd
+   dpkg -i com.tlsf.callaudioinjector_1.1.0_iphoneos-arm64.deb
+   killall -9 mediaserverd SpringBoard InCallService
    ```
 
 ---
@@ -88,15 +82,15 @@ ls -lh packages/
 ```text
 /var/mobile/Media/inject_audio.wav
 ```
-*(也可以是 `.mp3` 或 `.m4a`，在配置文件中指定即可)*
+*(支持 `.wav`、`.mp3`、`.m4a` 等，在配置文件中指定即可)*
 
-**重要**：放置音频后，请确保文件拥有读取权限：
+**权限设置**（重要）：
 ```bash
 chmod 644 /var/mobile/Media/inject_audio.wav
 ```
 
 ### 2. 配置文件选项
-可在 `/var/mobile/Library/Preferences/com.tlsf.callaudioinjector.plist` 中自定义配置（修改后实时生效或通过通知重载）：
+配置文件路径为 `/var/mobile/Library/Preferences/com.tlsf.callaudioinjector.plist`：
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -111,7 +105,7 @@ chmod 644 /var/mobile/Media/inject_audio.wav
     <key>loopPlayback</key>
     <true/>
 
-    <!-- 是否将麦克风静音（NO: 混音模式，对方既能听见你也能听见音频；YES: 仅播放音频） -->
+    <!-- 是否静音麦克风原声 (NO: 混音模式；YES: 仅播放音频，你的声音被静音) -->
     <key>muteMic</key>
     <false/>
 
@@ -119,65 +113,48 @@ chmod 644 /var/mobile/Media/inject_audio.wav
     <key>gain</key>
     <real>1.0</real>
 
-    <!-- 通话接通时是否自动播放 (YES / NO) -->
-    <key>autoPlayOnCall</key>
-    <false/>
-
-    <!-- 是否在通话界面显示悬浮控制按钮 -->
-    <key>showFloatingButton</key>
+    <!-- 长按电源键是否仅在通话中生效 (YES: 仅通话中唤出，平时仍为 Siri/关机；NO: 随时生效) -->
+    <key>requireCallForPowerButton</key>
     <true/>
+
+    <!-- 初始是否直接显示悬浮按钮 (NO: 默认隐藏，等待长按电源键唤出；YES: 接通即显示) -->
+    <key>showFloatingButtonInitially</key>
+    <false/>
 </dict>
 </plist>
 ```
 
 ---
 
-## 🕹️ 控制方式
+## 🕹️ 使用方法
 
-### 方式一：通话界面悬浮按钮
-接通电话时，通话屏幕上方会出现绿色 `[🎙️ 注入音频]` 按钮：
-- 点击变为红色 `[⏹ 停止注入]`，音频开始混入麦克风流传输给对方；
-- 再次点击停止；
-- 按钮支持任意拖动位置。
-
-### 方式二：命令行 / 快捷指令 (Darwin 通知)
-通过终端命令或越狱快捷指令插件触发广播：
-```bash
-# 开始播放
-notify_post com.tlsf.callaudioinjector.play
-
-# 停止播放
-notify_post com.tlsf.callaudioinjector.stop
-
-# 切换播放/停止
-notify_post com.tlsf.callaudioinjector.toggle
-```
+1. **接通电话**（普通蜂窝电话、FaceTime 或微信/CallKit 电话均支持）。
+2. **长按机身电源键（侧边键）约 0.8~1 秒**：
+   - 手机会产生一次轻触触觉震动反馈；
+   - 屏幕上将平滑浮现 `[🎙️ 注入音频]` 悬浮胶囊；
+3. **点击悬浮按钮**：
+   - 按钮变为红色 `[⏹ 停止注入]`，音频文件开始注入麦克风，对方能实时清晰听到；
+   - 再次点击停止注入；
+4. **再次长按电源键**：
+   - 悬浮按钮平滑淡出隐藏，不遮挡屏幕；
+5. **通话挂断**：
+   - 自动停止音频播放并清理悬浮窗。
 
 ---
 
 ## 🚀 GitHub 版本管理与发布
 
-本项目已配置 `.github/workflows/build.yml` 工作流。
-
-### 1. 关联并推送到 GitHub 远程仓库
+### 提交更新并打 Tag
 ```bash
-# 初始化并提交本地修改
-git init
+cd /Users/tlsf/.gemini/antigravity/scratch/CallAudioInjector
+
 git add .
-git commit -m "feat: initial commit for CallAudioInjector v1.0.0"
+git commit -m "feat: add power button long press to toggle floating button (v1.1.0)"
 
-# 使用 GitHub CLI 一键创建远程仓库（或手动在 GitHub 网页新建）
-gh repo create CallAudioInjector --public --source=. --push
-```
+# 打版本标签发布 Release
+git tag -a v1.1.0 -m "Release version 1.1.0: support long press power button trigger"
 
-### 2. 发布新版本（自动化生成 Release & Deb）
-当需要发布新版本时，只需打 Tag 并推送至 GitHub：
-```bash
-# 1. 修改 control 中的 Version: 1.0.1
-# 2. 提交并打标签
-git add control
-git commit -m "release: v1.0.1"
-git tag -a v1.0.1 -m "Release version 1.0.1"
+# 推送至 GitHub（若已关联 remote）
 git push origin main --tags
 ```
-GitHub Actions 将自动执行编译、生成 arm64/arm64e 双架构 rootless deb，并将 deb 文件直接挂载到该 GitHub Release 附件中供下载！
+GitHub Actions 会自动在 macOS 云端构建并将包含 arm64 + arm64e 的 deb 发布至 GitHub Releases！
