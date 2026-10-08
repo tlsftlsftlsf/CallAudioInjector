@@ -12,4 +12,4 @@ CallAudioInjector_FRAMEWORKS = AudioToolbox CoreAudio Foundation UIKit AVFoundat
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
-INSTALL_TARGET_PROCESSES = mediaserverd InCallService SpringBoard
+INSTALL_TARGET_PROCESSES = mediaserverd SpringBoard
