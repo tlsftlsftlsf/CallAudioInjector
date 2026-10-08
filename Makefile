@@ -4,11 +4,15 @@ THEOS_PACKAGE_SCHEME = rootless
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = CallAudioInjector
+TWEAK_NAME = CallAudioInjector CallAudioInjectorUI
 
-CallAudioInjector_FILES = Tweak.x
-CallAudioInjector_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-deprecated-declarations -Wno-arc-performSelector-leaks
-CallAudioInjector_FRAMEWORKS = AudioToolbox CoreAudio Foundation UIKit AVFoundation
+CallAudioInjector_FILES = TweakServer.x
+CallAudioInjector_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-deprecated-declarations
+CallAudioInjector_FRAMEWORKS = AudioToolbox CoreAudio Foundation AVFoundation
+
+CallAudioInjectorUI_FILES = TweakUI.x
+CallAudioInjectorUI_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-deprecated-declarations
+CallAudioInjectorUI_FRAMEWORKS = UIKit Foundation AudioToolbox
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
