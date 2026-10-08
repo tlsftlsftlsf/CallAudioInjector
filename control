@@ -1,8 +1,8 @@
 Package: com.tlsf.callaudioinjector
 Name: CallAudioInjector
-Version: 1.2.1
+Version: 1.3.0
 Architecture: iphoneos-arm64
-Description: iOS 17 专属：任何时候长按电源键显隐全局悬浮窗，通话时注入音频（对方听到）。修复窗口显示机制。
+Description: iOS 17 专属插件：长按音量下键显隐全局悬浮窗，通话时注入指定音频至麦克风（对方听到）。
 Maintainer: tlsf
 Author: tlsf
 Section: Tweaks

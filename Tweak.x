@@ -289,22 +289,16 @@ static OSStatus my_AudioUnitRender(AudioUnit inUnit,
 }
 
 // ============================================================================
-// PART 2: SpringBoard 进程 —— 全局穿透悬浮窗与按键捕获 (iOS 17)
+// PART 2: SpringBoard 全局悬浮窗 (可靠的穿透 Window 实现)
 // ============================================================================
 
-@interface CAIFloatingWindow : UIWindow
+@interface CAIPassThroughWindow : UIWindow
 @end
 
-@implementation CAIFloatingWindow
-- (BOOL)_isSecure {
-    return YES;
-}
-- (BOOL)_canBecomeKeyWindow {
-    return NO;
-}
+@implementation CAIPassThroughWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hitView = [super hitTest:point withEvent:event];
-    // 只有点击到胶囊按钮本身才响应，透明背景区域全部穿透给底层系统/App！
+    // 只有点击在胶囊按钮内部才拦截，其余透明背景全部穿透给底层应用/系统！
     if (hitView == self || hitView == self.rootViewController.view) {
         return nil;
     }
@@ -312,9 +306,9 @@ static OSStatus my_AudioUnitRender(AudioUnit inUnit,
 }
 @end
 
-static UIWindow *g_floatingWindow = nil;
+static CAIPassThroughWindow *g_floatingWindow = nil;
 static UIButton *g_floatingButton = nil;
-static NSTimeInterval g_lastLongPressTriggerTime = 0;
+static NSTimeInterval g_lastToggleTime = 0;
 
 static void UpdateFloatingButtonUI(BOOL active) {
     if (!g_floatingButton) return;
@@ -376,96 +370,93 @@ static void OnFloatingButtonClicked(void) {
 static void EnsureFloatingWindowCreated(void) {
     if (g_floatingWindow) return;
 
-    // 1. 获取 SpringBoard 当前可靠的 WindowScene
-    UIWindowScene *activeScene = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]]) {
-            activeScene = (UIWindowScene *)scene;
-            if (scene.activationState == UISceneActivationStateForegroundActive) {
-                break;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_floatingWindow) return;
+
+        UIWindowScene *activeScene = nil;
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                activeScene = (UIWindowScene *)scene;
+                if (scene.activationState == UISceneActivationStateForegroundActive) {
+                    break;
+                }
             }
         }
-    }
 
-    if (!activeScene) {
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (w.windowScene) {
-                activeScene = w.windowScene;
-                break;
+        if (!activeScene) {
+            for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                if (w.windowScene) {
+                    activeScene = w.windowScene;
+                    break;
+                }
             }
         }
-    }
 
-    CGRect screenBounds = [UIScreen mainScreen].bounds;
+        CGRect screenBounds = [UIScreen mainScreen].bounds;
+        if (activeScene) {
+            g_floatingWindow = [[CAIPassThroughWindow alloc] initWithWindowScene:activeScene];
+        } else {
+            g_floatingWindow = [[CAIPassThroughWindow alloc] initWithFrame:screenBounds];
+        }
 
-    // 2. 优先采用 SpringBoard 自身的 SBSecureWindow
-    Class sbSecureWindowClass = objc_getClass("SBSecureWindow");
-    if (!sbSecureWindowClass) {
-        sbSecureWindowClass = objc_getClass("SBWindow");
-    }
+        g_floatingWindow.frame = screenBounds;
+        g_floatingWindow.windowLevel = UIWindowLevelAlert + 9999.0f; // 保证在最顶层
+        g_floatingWindow.backgroundColor = [UIColor clearColor];
 
-    if (sbSecureWindowClass && activeScene) {
-        g_floatingWindow = [[sbSecureWindowClass alloc] initWithWindowScene:activeScene];
-        NSLog(@"[CallAudioInjector] 使用 SBSecureWindow 创建悬浮窗成功");
-    } else if (activeScene) {
-        g_floatingWindow = [[CAIFloatingWindow alloc] initWithWindowScene:activeScene];
-        NSLog(@"[CallAudioInjector] 使用 CAIFloatingWindow(activeScene) 创建悬浮窗成功");
-    } else {
-        g_floatingWindow = [[CAIFloatingWindow alloc] initWithFrame:screenBounds];
-        NSLog(@"[CallAudioInjector] 警告: 未找到 WindowScene, 使用 initWithFrame 创建");
-    }
+        UIViewController *rootVC = [[UIViewController alloc] init];
+        rootVC.view.backgroundColor = [UIColor clearColor];
+        rootVC.view.frame = screenBounds;
+        g_floatingWindow.rootViewController = rootVC;
 
-    g_floatingWindow.frame = screenBounds;
-    g_floatingWindow.windowLevel = 10000000.0f; // 顶层窗口
-    g_floatingWindow.backgroundColor = [UIColor clearColor];
+        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        btn.frame = CGRectMake(screenBounds.size.width - 130 - 16, 120, 130, 48);
+        btn.layer.cornerRadius = 24.0;
+        btn.layer.masksToBounds = YES;
+        btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.4].CGColor;
+        btn.layer.borderWidth = 1.0;
+        btn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+        [btn setTitle:@"🎙️ 注入音频" forState:UIControlStateNormal];
+        btn.backgroundColor = [UIColor colorWithRed:0.12 green:0.68 blue:0.38 alpha:0.95];
 
-    UIViewController *rootVC = [[UIViewController alloc] init];
-    rootVC.view.backgroundColor = [UIColor clearColor];
-    rootVC.view.frame = screenBounds;
-    g_floatingWindow.rootViewController = rootVC;
+        // 阴影
+        btn.layer.shadowColor = [UIColor blackColor].CGColor;
+        btn.layer.shadowOffset = CGSizeMake(0, 3);
+        btn.layer.shadowOpacity = 0.3;
+        btn.layer.shadowRadius = 6.0;
 
-    // 3. 悬浮胶囊按钮
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-    btn.frame = CGRectMake(screenBounds.size.width - 130 - 16, 120, 130, 48);
-    btn.layer.cornerRadius = 24.0;
-    btn.layer.masksToBounds = YES;
-    btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.4].CGColor;
-    btn.layer.borderWidth = 1.0;
-    btn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    [btn setTitle:@"🎙️ 注入音频" forState:UIControlStateNormal];
-    btn.backgroundColor = [UIColor colorWithRed:0.12 green:0.68 blue:0.38 alpha:0.95];
+        [btn addTarget:rootVC action:@selector(toggleAudioAction) forControlEvents:UIControlEventTouchUpInside];
 
-    [btn addTarget:rootVC action:@selector(toggleAudioAction) forControlEvents:UIControlEventTouchUpInside];
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:rootVC action:@selector(handlePan:)];
+        [btn addGestureRecognizer:pan];
 
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:rootVC action:@selector(handlePan:)];
-    [btn addGestureRecognizer:pan];
+        [rootVC.view addSubview:btn];
+        g_floatingButton = btn;
 
-    [rootVC.view addSubview:btn];
-    g_floatingButton = btn;
+        // 关键步骤：先 makeKeyAndVisible 将图层挂载至渲染管线，然后隐藏！
+        [g_floatingWindow makeKeyAndVisible];
+        g_floatingWindow.hidden = YES;
 
-    g_floatingWindow.hidden = YES;
-    g_floatingWindow.alpha = 1.0f; // 保持 alpha 始终为 1.0，完全依靠 hidden 控制显隐
+        NSLog(@"[CallAudioInjector] ★★★ 全局穿透悬浮窗构建并挂载完成 ★★★");
+    });
 }
 
-// 显隐悬浮窗口
-static void ToggleFloatingWindowInSpringBoard(void) {
+static void ToggleFloatingWindow(void) {
     NSTimeInterval now = CACurrentMediaTime();
-    if (now - g_lastLongPressTriggerTime < 0.6) {
+    if (now - g_lastToggleTime < 0.5) {
         return;
     }
-    g_lastLongPressTriggerTime = now;
+    g_lastToggleTime = now;
 
     dispatch_async(dispatch_get_main_queue(), ^{
         EnsureFloatingWindowCreated();
 
-        // 触觉反馈
+        // 震动反馈
         UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
         [feedback prepare];
         [feedback impactOccurred];
 
         if (g_floatingWindow.hidden) {
-            [g_floatingWindow setHidden:NO];
-            g_floatingWindow.alpha = 1.0f;
+            g_floatingWindow.hidden = NO;
             g_floatingButton.transform = CGAffineTransformMakeScale(0.7, 0.7);
             [UIView animateWithDuration:0.3 delay:0 usingSpringWithDamping:0.75 initialSpringVelocity:0.8 options:0 animations:^{
                 g_floatingButton.transform = CGAffineTransformIdentity;
@@ -475,7 +466,7 @@ static void ToggleFloatingWindowInSpringBoard(void) {
             [UIView animateWithDuration:0.2 animations:^{
                 g_floatingButton.transform = CGAffineTransformMakeScale(0.75, 0.75);
             } completion:^(BOOL finished) {
-                [g_floatingWindow setHidden:YES];
+                g_floatingWindow.hidden = YES;
                 g_floatingButton.transform = CGAffineTransformIdentity;
             }];
             NSLog(@"[CallAudioInjector] 悬浮窗已隐藏");
@@ -484,72 +475,77 @@ static void ToggleFloatingWindowInSpringBoard(void) {
 }
 
 // ============================================================================
-// PART 3: 硬件电源键底层长按捕获 (4 重保障机制)
+// PART 3: 长按音量下键底层捕获引擎
 // ============================================================================
 
-static dispatch_source_t g_longPressTimer = nil;
-static BOOL g_isLongPressTriggered = NO;
+static dispatch_source_t g_volumeDownTimer = nil;
+static BOOL g_isVolumeDownHeld = NO;
+static BOOL g_volumeDownLongPressTriggered = NO;
 
-static void OnLockButtonDown(void) {
-    g_isLongPressTriggered = NO;
+static void OnVolumeDownDown(void) {
+    g_isVolumeDownHeld = YES;
+    g_volumeDownLongPressTriggered = NO;
 
-    if (g_longPressTimer) {
-        dispatch_source_cancel(g_longPressTimer);
-        g_longPressTimer = nil;
+    if (g_volumeDownTimer) {
+        dispatch_source_cancel(g_volumeDownTimer);
+        g_volumeDownTimer = nil;
     }
 
-    g_longPressTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    dispatch_source_set_timer(g_longPressTimer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.65 * NSEC_PER_SEC)), DISPATCH_TIME_FOREVER, 0);
-    dispatch_source_set_event_handler(g_longPressTimer, ^{
-        g_isLongPressTriggered = YES;
-        NSLog(@"[CallAudioInjector] [方案1] 电源键长按达到 0.65 秒 -> 触发显隐悬浮窗！");
-        ToggleFloatingWindowInSpringBoard();
-        if (g_longPressTimer) {
-            dispatch_source_cancel(g_longPressTimer);
-            g_longPressTimer = nil;
+    g_volumeDownTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    // 按住音量下键 0.6 秒判定为长按
+    dispatch_source_set_timer(g_volumeDownTimer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), DISPATCH_TIME_FOREVER, 0);
+    dispatch_source_set_event_handler(g_volumeDownTimer, ^{
+        if (g_isVolumeDownHeld) {
+            g_volumeDownLongPressTriggered = YES;
+            NSLog(@"[CallAudioInjector] ★★★ 成功捕获长按音量下键 0.6s -> 触发悬浮窗！★★★");
+            ToggleFloatingWindow();
+        }
+        if (g_volumeDownTimer) {
+            dispatch_source_cancel(g_volumeDownTimer);
+            g_volumeDownTimer = nil;
         }
     });
-    dispatch_resume(g_longPressTimer);
+    dispatch_resume(g_volumeDownTimer);
 }
 
-static BOOL OnLockButtonUp(void) {
-    if (g_longPressTimer) {
-        dispatch_source_cancel(g_longPressTimer);
-        g_longPressTimer = nil;
+static BOOL OnVolumeDownUp(void) {
+    g_isVolumeDownHeld = NO;
+    if (g_volumeDownTimer) {
+        dispatch_source_cancel(g_volumeDownTimer);
+        g_volumeDownTimer = nil;
     }
 
-    if (g_isLongPressTriggered) {
-        NSLog(@"[CallAudioInjector] 电源键抬起：长按已触发，拦截锁屏动作");
-        g_isLongPressTriggered = NO;
-        return YES; // 消费按键，阻止锁屏
+    if (g_volumeDownLongPressTriggered) {
+        NSLog(@"[CallAudioInjector] 音量下键抬起，长按事件已消费");
+        g_volumeDownLongPressTriggered = NO;
+        return YES; // 消费长按事件，抑制默认音量改变
     }
-    return NO;
+    return NO; // 正常短按，正常减小音量
 }
 
 %group SpringBoardHooks
 
-// 方案 1: Hook SpringBoard 底层电源键按压物理事件
+// 1. Hook SpringBoard 启动生命周期，尽早挂载 Window
 %hook SpringBoard
+- (void)applicationDidFinishLaunching:(id)application {
+    %orig;
+    NSLog(@"[CallAudioInjector] SpringBoard applicationDidFinishLaunching -> 预载入悬浮窗");
+    EnsureFloatingWindowCreated();
+}
+%end
 
-- (void)_lockButtonDown:(id)arg1 fromSource:(int)arg2 {
-    OnLockButtonDown();
+// 2. Hook SBVolumeHardwareButtonActions (音量按键底层硬件按压)
+%hook SBVolumeHardwareButtonActions
+
+- (void)volumeDecreasePressDown {
+    NSLog(@"[CallAudioInjector] volumeDecreasePressDown (音量下键按下)");
+    OnVolumeDownDown();
     %orig;
 }
 
-- (void)_lockButtonUp:(id)arg1 fromSource:(int)arg2 {
-    if (OnLockButtonUp()) {
-        return;
-    }
-    %orig;
-}
-
-- (void)_lockButtonDown:(id)arg1 {
-    OnLockButtonDown();
-    %orig;
-}
-
-- (void)_lockButtonUp:(id)arg1 {
-    if (OnLockButtonUp()) {
+- (void)volumeDecreasePressUp {
+    NSLog(@"[CallAudioInjector] volumeDecreasePressUp (音量下键抬起)");
+    if (OnVolumeDownUp()) {
         return;
     }
     %orig;
@@ -557,24 +553,12 @@ static BOOL OnLockButtonUp(void) {
 
 %end
 
-// 方案 2: Hook SBSiriHardwareButtonInteraction (侧边键长按调起 Siri 交互点)
-%hook SBSiriHardwareButtonInteraction
-- (void)observeLongPressDidBegin {
-    NSLog(@"[CallAudioInjector] [方案2] SBSiriHardwareButtonInteraction observeLongPressDidBegin 触发！");
-    ToggleFloatingWindowInSpringBoard();
-}
-
-- (BOOL)consumeLongPressUp {
-    return YES;
-}
-%end
-
-// 方案 3: Hook SBHBLongPressGestureRecognizer (长按手势识别器)
-%hook SBHBLongPressGestureRecognizer
-- (void)setState:(UIGestureRecognizerState)state {
-    if (state == UIGestureRecognizerStateBegan) {
-        NSLog(@"[CallAudioInjector] [方案3] SBHBLongPressGestureRecognizer 状态变为 Began！");
-        ToggleFloatingWindowInSpringBoard();
+// 3. Hook SBVolumeControl (长按期间抑制音量被连续按到 0)
+%hook SBVolumeControl
+- (void)decreaseVolume {
+    if (g_volumeDownLongPressTriggered) {
+        // 长按期间抑制音量减少
+        return;
     }
     %orig;
 }
@@ -632,8 +616,8 @@ static void HandleToggleUINotification(CFNotificationCenterRef center,
                                       CFStringRef name,
                                       const void *object,
                                       CFDictionaryRef userInfo) {
-    NSLog(@"[CallAudioInjector] [方案4] 收到 Darwin NOTIFY_TOGGLE_UI 指令，切换悬浮窗！");
-    ToggleFloatingWindowInSpringBoard();
+    NSLog(@"[CallAudioInjector] 收到 Darwin NOTIFY_TOGGLE_UI 指令，切换悬浮窗！");
+    ToggleFloatingWindow();
 }
 
 %ctor {
@@ -662,17 +646,17 @@ static void HandleToggleUINotification(CFNotificationCenterRef center,
             CFNotificationCenterAddObserver(darwin, NULL, HandleDarwinNotifications, CFSTR(NOTIFY_TOGGLE), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         }
 
-        // 2. SpringBoard：iOS 17 全局悬浮窗与硬件长按捕获
+        // 2. SpringBoard：长按音量下键与全局悬浮窗
         if ([processName isEqualToString:@"SpringBoard"] || [bundleID isEqualToString:@"com.apple.springboard"]) {
-            NSLog(@"[CallAudioInjector] 注入 SpringBoard 成功，激活 Hooks");
+            NSLog(@"[CallAudioInjector] 注入 SpringBoard 成功，激活音量下键 Hooks");
             %init(SpringBoardHooks);
 
             CFNotificationCenterRef darwin = CFNotificationCenterGetDarwinNotifyCenter();
             CFNotificationCenterAddObserver(darwin, NULL, HandleStateChangedNotification, CFSTR(NOTIFY_STATE), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
             CFNotificationCenterAddObserver(darwin, NULL, HandleToggleUINotification, CFSTR(NOTIFY_TOGGLE_UI), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
-            // 开机/注销 2 秒后预初始化悬浮窗对象
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            // 开机/注销 1.5 秒后预初始化悬浮窗
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 EnsureFloatingWindowCreated();
             });
         }
