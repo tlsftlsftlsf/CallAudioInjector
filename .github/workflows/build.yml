@@ -1,0 +1,55 @@
+name: Build and Release CallAudioInjector
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Rootless .deb
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Theos
+        uses: theos/action-setup@v1
+        with:
+          theos-src: theos/theos
+          theos-ref: master
+
+      - name: Download iOS SDK
+        run: |
+          mkdir -p $THEOS/sdks
+          curl -LO https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz
+          tar -xf iPhoneOS16.5.sdk.tar.xz -C $THEOS/sdks
+          rm iPhoneOS16.5.sdk.tar.xz
+
+      - name: Compile and Package .deb
+        run: |
+          make clean
+          make package FINALPACKAGE=1
+        env:
+          THEOS_PACKAGE_SCHEME: rootless
+
+      - name: Upload .deb Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallAudioInjector-deb
+          path: packages/*.deb
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packages/*.deb
+          draft: false
+          prerelease: false
+          generate_release_notes: true
