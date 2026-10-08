@@ -3,6 +3,8 @@
 #import <CoreAudio/CoreAudioTypes.h>
 #import <notify.h>
 #import <dlfcn.h>
+#import <math.h>
+#import <sys/stat.h>
 #import <substrate.h>
 
 #define PREF_PATH @"/var/mobile/Library/Preferences/com.tlsf.callaudioinjector.plist"
@@ -66,9 +68,74 @@ static void BroadcastInjectionState(BOOL active) {
     notify_post(NOTIFY_STATE);
 }
 
+// 自动生成内置测试音频（如果用户尚未放入自定义音频文件）
+static void EnsureDefaultAudioFileExists(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:DEFAULT_AUDIO_PATH]) {
+        return;
+    }
+
+    NSString *parentDir = [DEFAULT_AUDIO_PATH stringByDeletingLastPathComponent];
+    if (![fm fileExistsAtPath:parentDir]) {
+        [fm createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+
+    // 生成 3 秒清晰的 16kHz 16-bit 单声道测试提示音 (D5 -> A5 双音交替)
+    UInt32 sampleRate = 16000;
+    UInt16 channels = 1;
+    UInt16 bitsPerSample = 16;
+    UInt32 durationSec = 3;
+    UInt32 totalSamples = sampleRate * durationSec;
+    UInt32 dataBytes = totalSamples * (bitsPerSample / 8);
+
+    NSMutableData *wavData = [NSMutableData dataWithCapacity:44 + dataBytes];
+
+    // RIFF 标头
+    [wavData appendBytes:"RIFF" length:4];
+    UInt32 chunkSize = 36 + dataBytes;
+    [wavData appendBytes:&chunkSize length:4];
+    [wavData appendBytes:"WAVE" length:4];
+
+    // fmt 块
+    [wavData appendBytes:"fmt " length:4];
+    UInt32 subchunk1Size = 16;
+    [wavData appendBytes:&subchunk1Size length:4];
+    UInt16 audioFormat = 1; // PCM
+    [wavData appendBytes:&audioFormat length:2];
+    [wavData appendBytes:&channels length:2];
+    [wavData appendBytes:&sampleRate length:4];
+    UInt32 byteRate = sampleRate * channels * (bitsPerSample / 8);
+    [wavData appendBytes:&byteRate length:4];
+    UInt16 blockAlign = channels * (bitsPerSample / 8);
+    [wavData appendBytes:&blockAlign length:2];
+    [wavData appendBytes:&bitsPerSample length:2];
+
+    // data 块
+    [wavData appendBytes:"data" length:4];
+    [wavData appendBytes:&dataBytes length:4];
+
+    for (UInt32 i = 0; i < totalSamples; i++) {
+        double t = (double)i / (double)sampleRate;
+        double tone = 0.0;
+        double cycle = fmod(t, 1.0);
+        if (cycle < 0.75) {
+            double freq = (t < 1.5) ? 587.33 : 880.0; // 587Hz / 880Hz
+            tone = sin(2.0 * M_PI * freq * t) * 0.65;
+        }
+        int16_t sample = (int16_t)(tone * 32767.0);
+        [wavData appendBytes:&sample length:2];
+    }
+
+    if ([wavData writeToFile:DEFAULT_AUDIO_PATH atomically:YES]) {
+        chmod([DEFAULT_AUDIO_PATH UTF8String], 0666);
+        NSLog(@"[CallAudioInjector] 成功自动生成默认测试音频文件: %@", DEFAULT_AUDIO_PATH);
+    }
+}
+
 static BOOL LoadAudioFileForFormat(const AudioStreamBasicDescription *targetASBD) {
     ReloadPreferences();
     FreePCMBuffer();
+    EnsureDefaultAudioFileExists();
 
     if (![[NSFileManager defaultManager] fileExistsAtPath:g_audioFilePath]) {
         NSLog(@"[CallAudioInjector] 错误: 音频文件不存在: %@", g_audioFilePath);
@@ -79,14 +146,32 @@ static BOOL LoadAudioFileForFormat(const AudioStreamBasicDescription *targetASBD
     ExtAudioFileRef audioFile = NULL;
     OSStatus status = ExtAudioFileOpenURL((__bridge CFURLRef)fileURL, &audioFile);
     if (status != noErr || !audioFile) {
-        NSLog(@"[CallAudioInjector] 打开音频文件失败: %d", (int)status);
+        NSLog(@"[CallAudioInjector] 打开音频文件失败: %d (路径: %@)", (int)status, g_audioFilePath);
         return NO;
     }
+
+    // 匹配底层采集的采样率与位深（Float32 或 SInt16），单声道以保证向多声道/单声道灵活混音
+    BOOL isFloat = (targetASBD->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+    AudioStreamBasicDescription clientASBD;
+    memset(&clientASBD, 0, sizeof(clientASBD));
+    clientASBD.mFormatID = kAudioFormatLinearPCM;
+    clientASBD.mSampleRate = (targetASBD->mSampleRate > 0) ? targetASBD->mSampleRate : 16000.0;
+    clientASBD.mChannelsPerFrame = 1;
+    if (isFloat) {
+        clientASBD.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+        clientASBD.mBitsPerChannel = 32;
+    } else {
+        clientASBD.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+        clientASBD.mBitsPerChannel = 16;
+    }
+    clientASBD.mFramesPerPacket = 1;
+    clientASBD.mBytesPerFrame = clientASBD.mBitsPerChannel / 8;
+    clientASBD.mBytesPerPacket = clientASBD.mBytesPerFrame;
 
     status = ExtAudioFileSetProperty(audioFile,
                                      kExtAudioFileProperty_ClientDataFormat,
                                      sizeof(AudioStreamBasicDescription),
-                                     targetASBD);
+                                     &clientASBD);
     if (status != noErr) {
         NSLog(@"[CallAudioInjector] 设置 ClientDataFormat 失败: %d", (int)status);
         ExtAudioFileDispose(audioFile);
@@ -101,12 +186,7 @@ static BOOL LoadAudioFileForFormat(const AudioStreamBasicDescription *targetASBD
         return NO;
     }
 
-    UInt32 bytesPerFrame = targetASBD->mBytesPerFrame;
-    if (bytesPerFrame == 0) {
-        bytesPerFrame = (targetASBD->mBitsPerChannel / 8) * targetASBD->mChannelsPerFrame;
-    }
-    UInt32 totalBytes = (UInt32)(totalFrames * bytesPerFrame);
-
+    UInt32 totalBytes = (UInt32)(totalFrames * clientASBD.mBytesPerFrame);
     g_pcmBuffer = (UInt8 *)malloc(totalBytes);
     if (!g_pcmBuffer) {
         ExtAudioFileDispose(audioFile);
@@ -115,13 +195,14 @@ static BOOL LoadAudioFileForFormat(const AudioStreamBasicDescription *targetASBD
 
     AudioBufferList fillBufList;
     fillBufList.mNumberBuffers = 1;
-    fillBufList.mBuffers[0].mNumberChannels = targetASBD->mChannelsPerFrame;
+    fillBufList.mBuffers[0].mNumberChannels = 1;
     fillBufList.mBuffers[0].mDataByteSize = totalBytes;
     fillBufList.mBuffers[0].mData = g_pcmBuffer;
 
     UInt32 framesToRead = (UInt32)(totalFrames);
     status = ExtAudioFileRead(audioFile, &framesToRead, &fillBufList);
     if (status != noErr) {
+        NSLog(@"[CallAudioInjector] 读取解码音频失败: %d", (int)status);
         FreePCMBuffer();
         ExtAudioFileDispose(audioFile);
         return NO;
@@ -133,7 +214,8 @@ static BOOL LoadAudioFileForFormat(const AudioStreamBasicDescription *targetASBD
     g_cachedASBD = *targetASBD;
     g_hasCachedASBD = YES;
 
-    NSLog(@"[CallAudioInjector] 音频预载入成功! 采样率: %.1f Hz, 帧数: %u", targetASBD->mSampleRate, (unsigned int)g_pcmTotalFrames);
+    NSLog(@"[CallAudioInjector] 音频解码就绪! 采样率: %.1f Hz, 类型: %@, 总帧数: %u",
+          clientASBD.mSampleRate, isFloat ? @"Float32" : @"SInt16", (unsigned int)g_pcmTotalFrames);
 
     ExtAudioFileDispose(audioFile);
     return YES;
@@ -152,11 +234,20 @@ static void InjectAudioIntoBufferList(AudioUnit inUnit, AudioBufferList *ioData,
                                            1, // Bus 1: Mic
                                            &currentASBD,
                                            &asbdSize);
-    if (status != noErr) return;
+    if (status != noErr) {
+        // 尝试 Input scope
+        status = AudioUnitGetProperty(inUnit,
+                                      kAudioUnitProperty_StreamFormat,
+                                      kAudioUnitScope_Input,
+                                      1,
+                                      &currentASBD,
+                                      &asbdSize);
+        if (status != noErr) return;
+    }
 
     if (!g_hasCachedASBD || g_pcmBuffer == NULL ||
         g_cachedASBD.mSampleRate != currentASBD.mSampleRate ||
-        g_cachedASBD.mChannelsPerFrame != currentASBD.mChannelsPerFrame) {
+        ((g_cachedASBD.mFormatFlags & kAudioFormatFlagIsFloat) != (currentASBD.mFormatFlags & kAudioFormatFlagIsFloat))) {
         if (!LoadAudioFileForFormat(&currentASBD)) {
             g_isInjecting = NO;
             BroadcastInjectionState(NO);
@@ -182,49 +273,41 @@ static void InjectAudioIntoBufferList(AudioUnit inUnit, AudioBufferList *ioData,
     }
 
     BOOL isFloat = (currentASBD.mFormatFlags & kAudioFormatFlagIsFloat) != 0;
-    UInt32 bytesPerFrame = currentASBD.mBytesPerFrame;
-    if (bytesPerFrame == 0) {
-        bytesPerFrame = (currentASBD.mBitsPerChannel / 8) * currentASBD.mChannelsPerFrame;
-    }
-
-    UInt8 *injectFramePtr = g_pcmBuffer + (g_pcmFrameOffset * bytesPerFrame);
 
     for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
         AudioBuffer *buf = &ioData->mBuffers[b];
         if (buf->mData == NULL) continue;
+        UInt32 chCount = buf->mNumberChannels;
+        if (chCount == 0) chCount = 1;
 
         if (isFloat) {
             Float32 *mic = (Float32 *)buf->mData;
-            Float32 *inj = (Float32 *)injectFramePtr;
-            UInt32 samples = framesToMix * buf->mNumberChannels;
+            Float32 *inj = (Float32 *)g_pcmBuffer + g_pcmFrameOffset;
 
-            for (UInt32 s = 0; s < samples; s++) {
-                float injVal = inj[s] * g_gain;
-                if (g_muteMic) {
-                    mic[s] = injVal;
-                } else {
-                    float sum = mic[s] + injVal;
+            for (UInt32 f = 0; f < framesToMix; f++) {
+                float injVal = inj[f] * g_gain;
+                for (UInt32 c = 0; c < chCount; c++) {
+                    UInt32 idx = f * chCount + c;
+                    float base = g_muteMic ? 0.0f : mic[idx];
+                    float sum = base + injVal;
                     if (sum > 1.0f) sum = 1.0f;
                     else if (sum < -1.0f) sum = -1.0f;
-                    mic[s] = sum;
+                    mic[idx] = sum;
                 }
             }
-        } else if (currentASBD.mBitsPerChannel == 16) {
+        } else {
             SInt16 *mic = (SInt16 *)buf->mData;
-            SInt16 *inj = (SInt16 *)injectFramePtr;
-            UInt32 samples = framesToMix * buf->mNumberChannels;
+            SInt16 *inj = (SInt16 *)g_pcmBuffer + g_pcmFrameOffset;
 
-            for (UInt32 s = 0; s < samples; s++) {
-                int32_t injVal = (int32_t)(inj[s] * g_gain);
-                if (g_muteMic) {
-                    if (injVal > 32767) injVal = 32767;
-                    else if (injVal < -32768) injVal = -32768;
-                    mic[s] = (SInt16)injVal;
-                } else {
-                    int32_t sum = (int32_t)mic[s] + injVal;
+            for (UInt32 f = 0; f < framesToMix; f++) {
+                int32_t injVal = (int32_t)(inj[f] * g_gain);
+                for (UInt32 c = 0; c < chCount; c++) {
+                    UInt32 idx = f * chCount + c;
+                    int32_t base = g_muteMic ? 0 : (int32_t)mic[idx];
+                    int32_t sum = base + injVal;
                     if (sum > 32767) sum = 32767;
                     else if (sum < -32768) sum = -32768;
-                    mic[s] = (SInt16)sum;
+                    mic[idx] = (SInt16)sum;
                 }
             }
         }
@@ -251,8 +334,10 @@ static OSStatus my_AudioUnitRender(AudioUnit inUnit,
                                    AudioBufferList *ioData) {
     OSStatus status = orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp, inOutputBusNumber, inNumberFrames, ioData);
 
-    if (status == noErr && inOutputBusNumber == 1 && g_isInjecting && ioData != NULL) {
-        InjectAudioIntoBufferList(inUnit, ioData, inNumberFrames);
+    if (status == noErr && g_isInjecting && ioData != NULL && inNumberFrames > 0) {
+        if (inOutputBusNumber == 1) {
+            InjectAudioIntoBufferList(inUnit, ioData, inNumberFrames);
+        }
     }
 
     return status;
@@ -266,22 +351,24 @@ static void HandleDarwinNotifications(CFNotificationCenterRef center,
     NSString *notifyName = (__bridge NSString *)name;
     if ([notifyName isEqualToString:@NOTIFY_PLAY]) {
         ReloadPreferences();
+        EnsureDefaultAudioFileExists();
         g_isInjecting = YES;
         g_pcmFrameOffset = 0;
-        NSLog(@"[CallAudioInjector] mediaserverd 收到 PLAY");
+        NSLog(@"[CallAudioInjector] mediaserverd 收到 PLAY -> 激活注入");
         BroadcastInjectionState(YES);
     } else if ([notifyName isEqualToString:@NOTIFY_STOP]) {
         g_isInjecting = NO;
         g_pcmFrameOffset = 0;
-        NSLog(@"[CallAudioInjector] mediaserverd 收到 STOP");
+        NSLog(@"[CallAudioInjector] mediaserverd 收到 STOP -> 停止注入");
         BroadcastInjectionState(NO);
     } else if ([notifyName isEqualToString:@NOTIFY_TOGGLE]) {
         ReloadPreferences();
+        EnsureDefaultAudioFileExists();
         g_isInjecting = !g_isInjecting;
         if (g_isInjecting) {
             g_pcmFrameOffset = 0;
         }
-        NSLog(@"[CallAudioInjector] mediaserverd 收到 TOGGLE, 当前状态: %d", g_isInjecting);
+        NSLog(@"[CallAudioInjector] mediaserverd 收到 TOGGLE -> 当前状态: %d", g_isInjecting);
         BroadcastInjectionState(g_isInjecting);
     }
 }
@@ -290,8 +377,17 @@ static void HandleDarwinNotifications(CFNotificationCenterRef center,
     @autoreleasepool {
         NSLog(@"[CallAudioInjector] 注入 mediaserverd 成功！");
         ReloadPreferences();
+        EnsureDefaultAudioFileExists();
 
         void *symbol = dlsym(RTLD_DEFAULT, "AudioUnitRender");
+        if (!symbol) {
+            dlopen("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox", RTLD_NOW | RTLD_GLOBAL);
+            symbol = dlsym(RTLD_DEFAULT, "AudioUnitRender");
+        }
+        if (!symbol) {
+            symbol = (void *)AudioUnitRender;
+        }
+
         if (symbol) {
             MSHookFunction(symbol, (void *)my_AudioUnitRender, (void **)&orig_AudioUnitRender);
             NSLog(@"[CallAudioInjector] Hook AudioUnitRender 成功！");

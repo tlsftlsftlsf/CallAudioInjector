@@ -5,37 +5,47 @@
 #import <substrate.h>
 
 #define PREF_PATH @"/var/mobile/Library/Preferences/com.tlsf.callaudioinjector.plist"
+#define NOTIFY_PLAY       "com.tlsf.callaudioinjector.play"
+#define NOTIFY_STOP       "com.tlsf.callaudioinjector.stop"
 #define NOTIFY_TOGGLE     "com.tlsf.callaudioinjector.toggle"
 #define NOTIFY_STATE      "com.tlsf.callaudioinjector.state_changed"
 #define NOTIFY_TOGGLE_UI  "com.tlsf.callaudioinjector.toggle_ui"
 
 // ============================================================================
-// 全局点击穿透窗口（仅胶囊自身响应事件，背景 100% 穿透给底层应用）
+// 全局点击穿透窗口（精准命中按钮，背景 100% 穿透）
 // ============================================================================
+
+static UIButton *g_floatingButton = nil;
+static BOOL g_isInjecting = NO;
+static NSTimeInterval g_lastTapActionTime = 0;
+static NSTimeInterval g_lastToggleTime = 0;
+static BOOL g_isDraggingButton = NO;
 
 @interface CAIPassThroughWindow : UIWindow
 @end
 
 @implementation CAIPassThroughWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hitView = [super hitTest:point withEvent:event];
-    if (hitView == self || hitView == self.rootViewController.view) {
-        return nil; // 点空白处穿透给系统/前台 App
+    if (g_floatingButton && !g_floatingButton.hidden && g_floatingButton.alpha > 0.01) {
+        CGPoint pInBtn = [self convertPoint:point toView:g_floatingButton];
+        // 扩展 12pt 触摸热区，手指即使轻微偏离也能灵敏响应
+        CGRect touchArea = CGRectInset(g_floatingButton.bounds, -12, -12);
+        if (CGRectContainsPoint(touchArea, pInBtn)) {
+            return g_floatingButton;
+        }
     }
-    return hitView; // 点在胶囊按钮上正常响应点击与拖拽
+    return nil;
 }
 @end
 
 static CAIPassThroughWindow *g_floatingWindow = nil;
-static UIButton *g_floatingButton = nil;
-static NSTimeInterval g_lastToggleTime = 0;
 
 static void UpdateFloatingButtonUI(BOOL active) {
     if (!g_floatingButton) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         if (active) {
             [g_floatingButton setTitle:@"⏹ 停止注入" forState:UIControlStateNormal];
-            g_floatingButton.backgroundColor = [UIColor colorWithRed:0.92 green:0.22 blue:0.22 alpha:0.95];
+            g_floatingButton.backgroundColor = [UIColor colorWithRed:0.92 green:0.20 blue:0.20 alpha:0.95];
         } else {
             [g_floatingButton setTitle:@"🎙️ 注入音频" forState:UIControlStateNormal];
             g_floatingButton.backgroundColor = [UIColor colorWithRed:0.12 green:0.72 blue:0.38 alpha:0.95];
@@ -43,21 +53,54 @@ static void UpdateFloatingButtonUI(BOOL active) {
     });
 }
 
+// 点击按钮响应动作（即时触觉 + 即时视觉 + 跨进程通知）
 static void OnFloatingButtonClicked(void) {
-    NSLog(@"[CallAudioInjectorUI] 悬浮按钮被点击，广播 TOGGLE 指令");
-    notify_post(NOTIFY_TOGGLE);
+    g_isInjecting = !g_isInjecting;
+    NSLog(@"[CallAudioInjectorUI] ★★★ 悬浮按钮点击生效！当前注入状态: %d ★★★", g_isInjecting);
+
+    // 1. 强力震动反馈
+    UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
+    [feedback prepare];
+    [feedback impactOccurred];
+
+    // 2. 立即更新界面颜色和文字（零延迟，无需等待 mediaserverd 跨进程确认）
+    UpdateFloatingButtonUI(g_isInjecting);
+
+    // 3. 弹性缩放按压动画
+    g_floatingButton.transform = CGAffineTransformMakeScale(0.88, 0.88);
+    [UIView animateWithDuration:0.25 delay:0 usingSpringWithDamping:0.5 initialSpringVelocity:0.8 options:0 animations:^{
+        g_floatingButton.transform = CGAffineTransformIdentity;
+    } completion:nil];
+
+    // 4. 广播指令给 mediaserverd
+    if (g_isInjecting) {
+        notify_post(NOTIFY_PLAY);
+    } else {
+        notify_post(NOTIFY_STOP);
+    }
 }
 
 @interface UIViewController (CAIFloatingButtonActions)
-- (void)toggleAudioAction;
+- (void)handleButtonTap;
 - (void)handlePan:(UIPanGestureRecognizer *)pan;
 @end
 
 @implementation UIViewController (CAIFloatingButtonActions)
-- (void)toggleAudioAction {
+- (void)handleButtonTap {
+    if (g_isDraggingButton) return;
+
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - g_lastTapActionTime < 0.25) return;
+    g_lastTapActionTime = now;
+
     OnFloatingButtonClicked();
 }
+
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
+    if (pan.state == UIGestureRecognizerStateBegan) {
+        g_isDraggingButton = YES;
+    }
+
     UIView *btn = pan.view;
     CGPoint translation = [pan translationInView:btn.superview];
     CGPoint newCenter = CGPointMake(btn.center.x + translation.x, btn.center.y + translation.y);
@@ -78,17 +121,19 @@ static void OnFloatingButtonClicked(void) {
     btn.center = newCenter;
     [pan setTranslation:CGPointZero inView:btn.superview];
 
-    // 松手时弹簧阻尼吸附至左侧或右侧边缘
     if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled) {
         CGFloat targetX = (newCenter.x < screenSize.width / 2.0) ? (halfW + 16) : (screenSize.width - halfW - 16);
         [UIView animateWithDuration:0.3 delay:0 usingSpringWithDamping:0.75 initialSpringVelocity:0.5 options:0 animations:^{
             btn.center = CGPointMake(targetX, btn.center.y);
-        } completion:nil];
+        } completion:^(BOOL finished) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                g_isDraggingButton = NO;
+            });
+        }];
     }
 }
 @end
 
-// 创建并直接显示悬浮窗口（安装/注销后直接显示）
 static void CreateAndShowFloatingWindow(void) {
     if (g_floatingWindow) {
         g_floatingWindow.hidden = NO;
@@ -103,7 +148,6 @@ static void CreateAndShowFloatingWindow(void) {
             return;
         }
 
-        // 1. 获取有效 UIWindowScene
         UIWindowScene *activeScene = nil;
         for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if ([scene isKindOfClass:[UIWindowScene class]]) {
@@ -128,7 +172,7 @@ static void CreateAndShowFloatingWindow(void) {
         }
 
         g_floatingWindow.frame = screenBounds;
-        g_floatingWindow.windowLevel = UIWindowLevelAlert + 9999.0f; // 保证在所有系统界面顶层
+        g_floatingWindow.windowLevel = UIWindowLevelAlert + 9999.0f;
         g_floatingWindow.backgroundColor = [UIColor clearColor];
 
         UIViewController *rootVC = [[UIViewController alloc] init];
@@ -136,7 +180,7 @@ static void CreateAndShowFloatingWindow(void) {
         rootVC.view.frame = screenBounds;
         g_floatingWindow.rootViewController = rootVC;
 
-        // 2. 悬浮胶囊按钮
+        // 胶囊按钮
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
         btn.frame = CGRectMake(screenBounds.size.width - 136 - 16, 140, 136, 48);
         btn.layer.cornerRadius = 24.0;
@@ -152,15 +196,25 @@ static void CreateAndShowFloatingWindow(void) {
         btn.layer.shadowOpacity = 0.45;
         btn.layer.shadowRadius = 8.0;
 
-        [btn addTarget:rootVC action:@selector(toggleAudioAction) forControlEvents:UIControlEventTouchUpInside];
+        // 1. 传统 Target-Action 绑定点击
+        [btn addTarget:rootVC action:@selector(handleButtonTap) forControlEvents:UIControlEventTouchUpInside];
 
+        // 2. 手势识别绑定点击（双重保障）
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:rootVC action:@selector(handleButtonTap)];
+
+        // 3. 拖动手势（cancelsTouchesInView = NO 确保点击事件不被吞食）
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:rootVC action:@selector(handlePan:)];
+        pan.cancelsTouchesInView = NO;
+
+        [tap requireGestureRecognizerToFail:pan];
+
+        [btn addGestureRecognizer:tap];
         [btn addGestureRecognizer:pan];
 
         [rootVC.view addSubview:btn];
         g_floatingButton = btn;
 
-        // 3. 【核心要求】安装/加载完成后直接显示！
+        // 直接挂载并显示
         [g_floatingWindow makeKeyAndVisible];
         g_floatingWindow.hidden = NO;
         g_floatingWindow.alpha = 1.0f;
@@ -169,7 +223,6 @@ static void CreateAndShowFloatingWindow(void) {
     });
 }
 
-// 切换显隐（长按音量下键触发）
 static void ToggleFloatingWindow(void) {
     NSTimeInterval now = CACurrentMediaTime();
     if (now - g_lastToggleTime < 0.5) return;
@@ -204,10 +257,7 @@ static void ToggleFloatingWindow(void) {
     });
 }
 
-// ============================================================================
-// 按键捕获：长按音量下键切换悬浮窗显隐
-// ============================================================================
-
+// 长按音量下键捕获
 static dispatch_source_t g_volumeDownTimer = nil;
 static BOOL g_isVolumeDownHeld = NO;
 static BOOL g_volumeDownLongPressTriggered = NO;
@@ -226,7 +276,7 @@ static void OnVolumeDownDown(void) {
     dispatch_source_set_event_handler(g_volumeDownTimer, ^{
         if (g_isVolumeDownHeld) {
             g_volumeDownLongPressTriggered = YES;
-            NSLog(@"[CallAudioInjectorUI] ★★★ 监听到长按音量下键达到 0.6s -> 切换悬浮窗 ★★★");
+            NSLog(@"[CallAudioInjectorUI] 长按音量下键 0.6s -> 切换悬浮窗显隐");
             ToggleFloatingWindow();
         }
         if (g_volumeDownTimer) {
@@ -246,21 +296,18 @@ static BOOL OnVolumeDownUp(void) {
 
     if (g_volumeDownLongPressTriggered) {
         g_volumeDownLongPressTriggered = NO;
-        return YES; // 消费按键，抑制默认音量减少
+        return YES;
     }
     return NO;
 }
 
-// Hook SpringBoard 生命周期
 %hook SpringBoard
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
-    NSLog(@"[CallAudioInjectorUI] SpringBoard applicationDidFinishLaunching -> 直接显示悬浮窗");
     CreateAndShowFloatingWindow();
 }
 %end
 
-// Hook SBVolumeHardwareButtonActions (按住音量下键)
 %hook SBVolumeHardwareButtonActions
 - (void)volumeDecreasePressDown {
     OnVolumeDownDown();
@@ -274,7 +321,6 @@ static BOOL OnVolumeDownUp(void) {
 }
 %end
 
-// Hook SBVolumeControl (长按期间防音量连续减少至静音)
 %hook SBVolumeControl
 - (void)decreaseVolume {
     if (g_volumeDownLongPressTriggered) {
@@ -294,7 +340,8 @@ static void HandleStateChangedNotification(CFNotificationCenterRef center,
     uint64_t state = 0;
     notify_get_state(token, &state);
     notify_cancel(token);
-    UpdateFloatingButtonUI(state == 1);
+    g_isInjecting = (state == 1);
+    UpdateFloatingButtonUI(g_isInjecting);
 }
 
 static void HandleToggleUINotification(CFNotificationCenterRef center,
@@ -313,7 +360,6 @@ static void HandleToggleUINotification(CFNotificationCenterRef center,
         CFNotificationCenterAddObserver(darwin, NULL, HandleStateChangedNotification, CFSTR(NOTIFY_STATE), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         CFNotificationCenterAddObserver(darwin, NULL, HandleToggleUINotification, CFSTR(NOTIFY_TOGGLE_UI), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
-        // 确保安装与注销后直接弹出显示
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             CreateAndShowFloatingWindow();
         });

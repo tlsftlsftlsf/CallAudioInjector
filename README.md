@@ -2,31 +2,26 @@
 
 CallAudioInjector 是一款**专为 iOS 17（Rootless 无根越狱架构，Dopamine 2.x / palera1n）深度定制**的全局通话音频注入插件。
 
-**【v1.4.0 核心更新】安装后直接在屏幕顶层显示悬浮窗口，无需按任何按键！**
-同时支持**长按音量下键随时隐藏/唤出悬浮窗**，并在通话过程中将指定音频文件实时混入麦克风采集音频流（Uplink / Bus 1），**让通话另一方（对方）清晰听到指定音频**。
+**【v1.5.0 核心更新】**
+1. **解决点击按钮无反应问题**：彻底隔离拖拽手势与点击事件，增加 12pt 触控扩展热区（Hit Slop），实现**即时触觉震动 + 弹性缩放动画 + 即刻变色/改字**（零延迟反馈）。
+2. **开箱即用自动生成测试音频**：若手机中尚未放入音频文件，插件自动在 `/var/mobile/Media/inject_audio.wav` 生成标准双音测试音频，避免因找不到文件导致注入静默失败。
+3. **安装注销后屏幕直接常驻悬浮**：无需任何按键，注销后直接在屏幕顶层展现绿色 `[🎙️ 注入音频]` 胶囊。长按音量下键 0.6 秒随时收起/唤出。
 
 ---
 
-## 🌟 v1.4.0 架构升级与“不显示”问题根本解决
+## 🌟 核心功能与技术实现
 
-### 1. 彻底解决“悬浮窗不显示”：双 Dylib 架构分离
-- 此前由于在单个 plist 中同时声明了 `Bundles`（SpringBoard）与 `Executables`（mediaserverd），在部分越狱加载器（如 ElleKit）中会导致过滤逻辑冲突，致使 SpringBoard 根本未加载 UI 模块！
-- **重构为双 Dylib 独立架构**：
-  - `CallAudioInjector.dylib`：专职注入 `mediaserverd`，仅处理麦克风底层 CoreAudio 音频混合。
-  - `CallAudioInjectorUI.dylib`：专职注入 `SpringBoard`，仅处理全局穿透悬浮窗与按键交互。
-  - 两个模块通过 Darwin 跨进程通信，彻底消除了加载器冲突。
+### 1. 极速触控响应与双重事件保障 (v1.5.0)
+- **手势防吞食**：将 `UIPanGestureRecognizer` 设为与 `UITapGestureRecognizer` 互斥识别（`requireGestureRecognizerToFail:`），彻底解决此前拖拽手势吞食点击事件导致的“按了没反应”。
+- **零延迟界面与震动反馈**：点击瞬间立即触发 Heavy 触觉震动反馈、弹性缩放按压动画，并立即在主线程将按钮切换为红色 `[⏹ 停止注入]`，无需等待底层跨进程 IPC 响应。
+- **12pt 点击热区扩展**：在 `hitTest:` 中对胶囊按钮四周扩展 12pt 热区，单手轻触也能精准命中。
 
-### 2. 安装/注销完成后「直接在屏幕显示悬浮窗」
-- 移除了启动时的 `hidden = YES`，窗口创建后**直接调用 `makeKeyAndVisible` 并保持常驻可见**！
-- 安装 deb 并注销（Respring）后，屏幕右上侧**立刻出现**绿色 `[🎙️ 注入音频]` 胶囊悬浮按钮，无需额外摸索触发！
+### 2. 内置默认测试音频 (v1.5.0)
+- 启动或点击注入时若检测到 `/var/mobile/Media/inject_audio.wav` 不存在，将自动合成一段 16kHz 16-bit PCM 测试音频并赋予读写权限，真正做到安装即用，随时验证通话效果。
 
-### 3. 长按音量下键收起/唤出（Volume Down）
-- 胶囊支持全屏幕自由拖拽，松手带物理阻尼吸附靠边。
-- 若觉得常驻遮挡，**按住机身左侧「音量下键」0.6 秒**即可平滑收起隐藏；再次长按音量下键重新唤出。
-- 长按期间自动抑制音量连续递减，短按则保持原本的调小音量功能。
-
-### 4. 对方听到（系统底层麦克风链路注入）
-- 拦截 CoreAudio `AudioUnitRender`（Bus 1 麦克风录音端），自动重采样并混入 PCM 音频，实现对端清晰收听。
+### 3. 双 Dylib 架构
+- `CallAudioInjector.dylib`：专职注入 `mediaserverd`，拦截 CoreAudio `AudioUnitRender`（Bus 1 麦克风录音链路），实现对端清晰收听。
+- `CallAudioInjectorUI.dylib`：专职注入 `SpringBoard`，提供全局穿透悬浮窗与按键捕获。
 
 ---
 
@@ -38,11 +33,11 @@ CallAudioInjector/
 │   └── workflows/
 │       └── build.yml               # GitHub Actions 自动化 CI 构建 & Release 工作流
 ├── Makefile                        # Theos 编译配置 (双 Dylib, Rootless, arm64 + arm64e)
-├── control                         # Debian 软件包元数据 (v1.4.0)
+├── control                         # Debian 软件包元数据 (v1.5.0)
 ├── CallAudioInjector.plist         # 服务端过滤 (mediaserverd)
 ├── CallAudioInjectorUI.plist       # UI 模块过滤 (com.apple.springboard)
-├── TweakServer.x                   # 底层音频流注入引擎源码
-├── TweakUI.x                       # SpringBoard 全局悬浮窗与按键捕获源码
+├── TweakServer.x                   # 底层音频流注入与格式自适应重采样
+├── TweakUI.x                       # SpringBoard 全局悬浮窗与按键交互
 ├── .gitignore                      # Git 忽略配置
 └── README.md                       # 说明文档
 ```
@@ -68,11 +63,11 @@ ls -lh packages/
 
 1. 将生成的 `.deb` 文件传输到 iOS 17 设备：
    ```text
-   packages/com.tlsf.callaudioinjector_1.4.0_iphoneos-arm64.deb
+   packages/com.tlsf.callaudioinjector_1.5.0_iphoneos-arm64.deb
    ```
 2. 在设备上安装并注销：
    ```bash
-   dpkg -i com.tlsf.callaudioinjector_1.4.0_iphoneos-arm64.deb
+   dpkg -i com.tlsf.callaudioinjector_1.5.0_iphoneos-arm64.deb
    killall -9 mediaserverd SpringBoard
    ```
 3. **注销完成后，屏幕右上方会直接出现绿色的 `[🎙️ 注入音频]` 悬浮胶囊！**
@@ -81,21 +76,21 @@ ls -lh packages/
 
 ## 🕹️ 使用指南
 
-1. **拖拽调整位置**：直接用手指拖动悬浮胶囊到舒适的位置，松手自动靠边吸附。
-2. **通话时注入音频**：接通电话后，点击悬浮胶囊变为红色 `[⏹ 停止注入]`，音频混入麦克风流，对方即可清晰听到；再次点击停止注入。
-3. **长按音量下键切换显隐**：按住「音量下键」约 0.6 秒可收起隐藏悬浮窗；再次长按重新唤出。
+1. **点击注入音频**：接通电话/VoIP语音后，点击悬浮胶囊立即震动并变为红色 `[⏹ 停止注入]`，音频注入麦克风流，**对方即可听到**；再次点击停止注入。
+2. **自由拖拽**：用手指按住拖动悬浮胶囊到屏幕任意位置，松手带物理弹簧阻尼吸附靠边。
+3. **长按音量下键显隐**：按住机身左侧「音量下键」约 0.6 秒即可隐藏悬浮窗；再次长按重新唤出。
 
 ---
 
-## 🎵 音频文件准备
+## 🎵 自定义音频文件替换
 
 默认音频路径为：
 ```text
 /var/mobile/Media/inject_audio.wav
 ```
-*(支持 `.wav`、`.mp3`、`.m4a`，放置后执行 `chmod 644 /var/mobile/Media/inject_audio.wav`)*
+*(插件支持常见的 `.wav`、`.mp3`、`.m4a` 格式，放置后执行 `chmod 644 /var/mobile/Media/inject_audio.wav` 即可自动解码与重采样)*
 
-在 `/var/mobile/Library/Preferences/com.tlsf.callaudioinjector.plist` 中可自由配置音量增益与静音模式：
+可在配置文件 `/var/mobile/Library/Preferences/com.tlsf.callaudioinjector.plist` 调节增益与静音麦克风：
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -121,7 +116,7 @@ ls -lh packages/
 cd /Users/tlsf/.gemini/antigravity/scratch/CallAudioInjector
 
 git add .
-git commit -m "feat: split into dual dylibs and show floating window directly on install (v1.4.0)"
-git tag -a v1.4.0 -m "Release v1.4.0: direct floating window display, dual dylib architecture"
+git commit -m "fix: touch hit-testing, immediate visual feedback, and auto test audio fallback (v1.5.0)"
+git tag -a v1.5.0 -m "Release v1.5.0: fix button touch responsiveness"
 git push origin main --tags
 ```
