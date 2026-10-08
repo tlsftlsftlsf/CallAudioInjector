@@ -1,0 +1,4 @@
+#!/bin/sh
+rm -f /tmp/cai_active.flag 2>/dev/null || true
+killall -9 audiomxd mediaserverd callservicesd InCallService MobilePhone 2>/dev/null || true
+exit 0

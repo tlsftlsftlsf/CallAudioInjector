@@ -12,6 +12,19 @@
 			<string>InCallService</string>
 			<string>coreaudiod</string>
 			<string>MobilePhone</string>
+			<string>WeChat</string>
+			<string>FaceTime</string>
+			<string>QQ</string>
+			<string>DingTalk</string>
+		</array>
+		<key>Bundles</key>
+		<array>
+			<string>com.apple.InCallService</string>
+			<string>com.apple.mobilephone</string>
+			<string>com.apple.facetime</string>
+			<string>com.tencent.xin</string>
+			<string>com.tencent.mqq</string>
+			<string>com.laiwang.DingTalk</string>
 		</array>
 	</dict>
 </dict>

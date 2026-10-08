@@ -214,33 +214,56 @@ static void UpdateFloatingButtonUI(BOOL active) {
     });
 }
 
-// 点击按钮响应动作（即时触觉 + 即时视觉 + 双引擎本机发声 + 跨进程通知）
-static void OnFloatingButtonClicked(void) {
-    g_isInjecting = !g_isInjecting;
-    CAILog(@"★★★ 悬浮按钮点击！切换后状态: %d ★★★", g_isInjecting);
+static void SetInjectionState(BOOL active) {
+    g_isInjecting = active;
+    CAILog(@"★★★ 切换注入状态: %d ★★★", g_isInjecting);
 
+    // 1. 立即更新界面颜色和文字
+    UpdateFloatingButtonUI(g_isInjecting);
+
+    // 2. POSIX 共享标志文件 (跨进程零延迟、免通知依赖)
+    if (g_isInjecting) {
+        int fd = open("/tmp/cai_active.flag", O_CREAT | O_WRONLY | O_TRUNC, 0666);
+        if (fd >= 0) close(fd);
+        chmod("/tmp/cai_active.flag", 0666);
+        CAILog(@"已创建 /tmp/cai_active.flag 标志文件");
+    } else {
+        unlink("/tmp/cai_active.flag");
+        CAILog(@"已移除 /tmp/cai_active.flag 标志文件");
+    }
+
+    // 3. Darwin 广播通知 & 内核状态同步
+    int stateToken = 0;
+    notify_register_check(NOTIFY_STATE, &stateToken);
+    notify_set_state(stateToken, g_isInjecting ? 1 : 0);
+    notify_post(NOTIFY_STATE);
+    notify_cancel(stateToken);
+
+    // 4. 双引擎启动本机发声并广播给服务端进程
+    if (g_isInjecting) {
+        notify_post(NOTIFY_PLAY);
+        [[CAILocalAudioPlayer sharedInstance] startPlaying];
+    } else {
+        notify_post(NOTIFY_STOP);
+        [[CAILocalAudioPlayer sharedInstance] stopPlaying];
+    }
+}
+
+// 点击按钮响应动作（即时触觉 + 即时视觉 + 双引擎本机发声 + 跨进程通知 + POSIX Flag）
+static void OnFloatingButtonClicked(void) {
     // 1. 强力震动反馈
     UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
     [feedback prepare];
     [feedback impactOccurred];
 
-    // 2. 立即更新界面颜色和文字
-    UpdateFloatingButtonUI(g_isInjecting);
-
-    // 3. 弹性缩放按压动画
+    // 2. 弹性缩放按压动画
     g_floatingButton.transform = CGAffineTransformMakeScale(0.88, 0.88);
     [UIView animateWithDuration:0.25 delay:0 usingSpringWithDamping:0.5 initialSpringVelocity:0.8 options:0 animations:^{
         g_floatingButton.transform = CGAffineTransformIdentity;
     } completion:nil];
 
-    // 4. 双引擎启动本机发声并广播给服务端进程
-    if (g_isInjecting) {
-        [[CAILocalAudioPlayer sharedInstance] startPlaying];
-        notify_post(NOTIFY_PLAY);
-    } else {
-        [[CAILocalAudioPlayer sharedInstance] stopPlaying];
-        notify_post(NOTIFY_STOP);
-    }
+    // 3. 切换注入状态
+    SetInjectionState(!g_isInjecting);
 }
 
 @interface UIViewController (CAIFloatingButtonActions)
@@ -503,10 +526,16 @@ static void HandleStateChangedNotification(CFNotificationCenterRef center,
     uint64_t state = 0;
     notify_get_state(token, &state);
     notify_cancel(token);
-    g_isInjecting = (state == 1);
-    UpdateFloatingButtonUI(g_isInjecting);
-    if (!g_isInjecting) {
-        [[CAILocalAudioPlayer sharedInstance] stopPlaying];
+    BOOL active = (state == 1);
+    if (g_isInjecting != active) {
+        g_isInjecting = active;
+        UpdateFloatingButtonUI(g_isInjecting);
+        if (g_isInjecting) {
+            [[CAILocalAudioPlayer sharedInstance] startPlaying];
+        } else {
+            [[CAILocalAudioPlayer sharedInstance] stopPlaying];
+            unlink("/tmp/cai_active.flag");
+        }
     }
 }
 
@@ -521,6 +550,7 @@ static void HandleToggleUINotification(CFNotificationCenterRef center,
 %ctor {
     @autoreleasepool {
         CAILog(@"成功加载入 SpringBoard (PID: %d)", getpid());
+        unlink("/tmp/cai_active.flag");
 
         CFNotificationCenterRef darwin = CFNotificationCenterGetDarwinNotifyCenter();
         CFNotificationCenterAddObserver(darwin, NULL, HandleStateChangedNotification, CFSTR(NOTIFY_STATE), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
